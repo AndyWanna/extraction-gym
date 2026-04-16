@@ -1,118 +1,9 @@
-mod extract;
-
-pub use extract::*;
-
-use egraph_serialize::*;
-
-use indexmap::IndexMap;
-use ordered_float::NotNan;
+use extraction_gym::*;
 
 use anyhow::Context;
 
 use std::io::Write;
 use std::path::PathBuf;
-
-pub type Cost = NotNan<f64>;
-pub const INFINITY: Cost = unsafe { NotNan::new_unchecked(f64::INFINITY) };
-
-#[derive(PartialEq, Eq)]
-enum Optimal {
-    Tree,
-    #[cfg(feature = "ilp-cbc")]
-    Dag,
-    Neither,
-}
-
-struct ExtractorDetail {
-    extractor: Box<dyn Extractor>,
-    #[cfg_attr(not(test), allow(dead_code))]
-    optimal: Optimal,
-    use_for_bench: bool,
-}
-
-fn extractors() -> IndexMap<&'static str, ExtractorDetail> {
-    let extractors: IndexMap<&'static str, ExtractorDetail> = [
-        (
-            "bottom-up",
-            ExtractorDetail {
-                extractor: extract::bottom_up::BottomUpExtractor.boxed(),
-                optimal: Optimal::Tree,
-                use_for_bench: true,
-            },
-        ),
-        (
-            "faster-bottom-up",
-            ExtractorDetail {
-                extractor: extract::faster_bottom_up::FasterBottomUpExtractor.boxed(),
-                optimal: Optimal::Tree,
-                use_for_bench: true,
-            },
-        ),
-        (
-            "prio-queue",
-            ExtractorDetail {
-                extractor: extract::prio_queue::PrioQueueExtractor.boxed(),
-                optimal: Optimal::Tree,
-                use_for_bench: true,
-            },
-        ),
-        (
-            "faster-greedy-dag",
-            ExtractorDetail {
-                extractor: extract::faster_greedy_dag::FasterGreedyDagExtractor.boxed(),
-                optimal: Optimal::Neither,
-                use_for_bench: true,
-            },
-        ),
-        /*(
-            "global-greedy-dag",
-            ExtractorDetail {
-                extractor: extract::global_greedy_dag::GlobalGreedyDagExtractor.boxed(),
-                optimal: Optimal::Neither,
-                use_for_bench: true,
-            },
-        ),*/
-        #[cfg(feature = "ilp-cbc")]
-        (
-            "ilp-cbc-timeout",
-            ExtractorDetail {
-                extractor: extract::ilp_cbc::CbcExtractorWithTimeout::<10>.boxed(),
-                optimal: Optimal::Dag,
-                use_for_bench: true,
-            },
-        ),
-        #[cfg(feature = "ilp-cbc")]
-        (
-            "ilp-cbc",
-            ExtractorDetail {
-                extractor: extract::ilp_cbc::CbcExtractor.boxed(),
-                optimal: Optimal::Dag,
-                use_for_bench: false, // takes >10 hours sometimes
-            },
-        ),
-        #[cfg(feature = "ilp-cbc")]
-        (
-            "faster-ilp-cbc-timeout",
-            ExtractorDetail {
-                extractor: extract::faster_ilp_cbc::FasterCbcExtractorWithTimeout::<10>.boxed(),
-                optimal: Optimal::Dag,
-                use_for_bench: true,
-            },
-        ),
-        #[cfg(feature = "ilp-cbc")]
-        (
-            "faster-ilp-cbc",
-            ExtractorDetail {
-                extractor: extract::faster_ilp_cbc::FasterCbcExtractor.boxed(),
-                optimal: Optimal::Dag,
-                use_for_bench: true,
-            },
-        ),
-    ]
-    .into_iter()
-    .collect();
-    extractors
-}
 
 fn main() {
     env_logger::init();
@@ -168,16 +59,13 @@ fn main() {
     log::info!("{filename:40}\t{extractor_name:10}\t{tree:5}\t{dag:5}\t{us:5}");
     writeln!(
         out_file,
-        r#"{{ 
+        r#"{{
     "name": "{filename}",
-    "extractor": "{extractor_name}", 
-    "tree": {tree}, 
-    "dag": {dag}, 
+    "extractor": "{extractor_name}",
+    "tree": {tree},
+    "dag": {dag},
     "micros": {us}
 }}"#
     )
     .unwrap();
 }
-
-#[cfg(test)]
-pub mod test;
