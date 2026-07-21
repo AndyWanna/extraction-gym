@@ -206,3 +206,212 @@ fn block_cycles(model: &mut Model, vars: &IndexMap<ClassId, ClassVars>, egraph: 
         }
     }
 }
+
+/* ------------------------------------------------------------------------- */
+/* Dual (area + critical-path delay) ILP extractor.                          */
+/*                                                                           */
+/* Minimises   alpha * (critical-path delay)  +  beta * (total area)         */
+/*                                                                           */
+/* Area is the additive sum of per-node `cost`, exactly like `extract`.      */
+/* Delay is the longest weighted path from the roots down to the leaves,     */
+/* using per-node `delay`. The max-over-paths is linearised with one         */
+/* arrival-time variable T_c per e-class and a big-M selection guard:        */
+/*                                                                           */
+/*   T_c >= delay_n + T_cc - M*(1 - x_n)     for each child class cc of n    */
+/*   T_c >= delay_n        - M*(1 - x_n)     for childless n                 */
+/*                                                                           */
+/* with 0 <= T_c <= S (S = sum of all delays). Capping T_c at S is what      */
+/* makes the big-M sound: it bounds delay_n + T_cc <= 2S, so M = 2S is safe. */
+/* The objective then minimises alpha*t + beta*sum(area*x) where t >= T_root.*/
+/* ------------------------------------------------------------------------- */
+
+/// Per-node area contribution (the additive cost term).
+fn node_area(node: &Node) -> f64 {
+    node.cost.into_inner()
+}
+
+/// Per-node delay contribution (the critical-path term).
+fn node_delay(node: &Node) -> f64 {
+    node.delay.into_inner()
+}
+
+pub struct DualCbcExtractor {
+    /// Solver time limit in seconds (u32::MAX for unbounded).
+    pub timeout_seconds: u32,
+    /// Weight on the critical-path delay.
+    pub alpha: f64,
+    /// Weight on the total area.
+    pub beta: f64,
+}
+
+impl Extractor for DualCbcExtractor {
+    fn extract(&self, egraph: &EGraph, roots: &[ClassId]) -> ExtractionResult {
+        extract_dual(egraph, roots, self.timeout_seconds, self.alpha, self.beta)
+    }
+}
+
+fn extract_dual(
+    egraph: &EGraph,
+    roots: &[ClassId],
+    timeout_seconds: u32,
+    alpha: f64,
+    beta: f64,
+) -> ExtractionResult {
+    let mut model = Model::default();
+    model.set_parameter("seconds", &timeout_seconds.to_string());
+
+    let vars: IndexMap<ClassId, ClassVars> = egraph
+        .classes()
+        .values()
+        .map(|class| {
+            let cvars = ClassVars {
+                active: model.add_binary(),
+                nodes: class.nodes.iter().map(|_| model.add_binary()).collect(),
+            };
+            (class.id.clone(), cvars)
+        })
+        .collect();
+
+    // Selection constraints: class active == some node active, and a node
+    // being active implies each of its child classes is active. Identical to
+    // the sum-cost `extract`.
+    for (class_id, class) in &vars {
+        let row = model.add_row();
+        model.set_row_equal(row, 0.0);
+        model.set_weight(row, class.active, -1.0);
+        for &node_active in &class.nodes {
+            model.set_weight(row, node_active, 1.0);
+        }
+
+        let childrens_classes_var = |nid: NodeId| {
+            egraph[&nid]
+                .children
+                .iter()
+                .map(|n| egraph[n].eclass.clone())
+                .map(|n| vars[&n].active)
+                .collect::<IndexSet<_>>()
+        };
+
+        for (node_id, &node_active) in egraph[class_id].nodes.iter().zip(&class.nodes) {
+            for child_active in childrens_classes_var(node_id.clone()) {
+                let row = model.add_row();
+                model.set_row_upper(row, 0.0);
+                model.set_weight(row, node_active, 1.0);
+                model.set_weight(row, child_active, -1.0);
+            }
+        }
+    }
+
+    // Arrival-time variables, bounded by S = sum of all delays.
+    let s: f64 = egraph
+        .classes()
+        .values()
+        .flat_map(|c| c.nodes.iter())
+        .map(|nid| node_delay(&egraph[nid]))
+        .sum();
+    let big_m = if s > 0.0 { 2.0 * s } else { 1.0 };
+
+    let arr: IndexMap<ClassId, Col> = vars
+        .keys()
+        .map(|c| {
+            let v = model.add_col();
+            model.set_col_lower(v, 0.0);
+            model.set_col_upper(v, s.max(0.0));
+            (c.clone(), v)
+        })
+        .collect();
+
+    for (class_id, class) in &vars {
+        let t_c = arr[class_id];
+        for (node_id, &x_n) in egraph[class_id].nodes.iter().zip(&class.nodes) {
+            let d_n = node_delay(&egraph[node_id]);
+            let child_classes = egraph[node_id]
+                .children
+                .iter()
+                .map(|n| egraph[n].eclass.clone())
+                .collect::<IndexSet<_>>();
+
+            if child_classes.is_empty() {
+                // T_c - M*x_n >= d_n - M
+                let row = model.add_row();
+                model.set_row_lower(row, d_n - big_m);
+                model.set_weight(row, t_c, 1.0);
+                model.set_weight(row, x_n, -big_m);
+            } else {
+                for cc in child_classes {
+                    // T_c - T_cc - M*x_n >= d_n - M
+                    let row = model.add_row();
+                    model.set_row_lower(row, d_n - big_m);
+                    model.set_weight(row, t_c, 1.0);
+                    model.set_weight(row, arr[&cc], -1.0);
+                    model.set_weight(row, x_n, -big_m);
+                }
+            }
+        }
+    }
+
+    // Objective: alpha * t + beta * sum(area * x), where t >= max root arrival.
+    model.set_obj_sense(Sense::Minimize);
+
+    let t = model.add_col();
+    model.set_col_lower(t, 0.0);
+    model.set_col_upper(t, s.max(0.0));
+    if alpha != 0.0 {
+        model.set_obj_coeff(t, alpha);
+    }
+    for root in roots {
+        // t - T_root >= 0
+        let row = model.add_row();
+        model.set_row_lower(row, 0.0);
+        model.set_weight(row, t, 1.0);
+        model.set_weight(row, arr[root], -1.0);
+    }
+
+    if beta != 0.0 {
+        for class in egraph.classes().values() {
+            for (node_id, &node_active) in class.nodes.iter().zip(&vars[&class.id].nodes) {
+                let area = beta * node_area(&egraph[node_id]);
+                if area != 0.0 {
+                    model.set_obj_coeff(node_active, area);
+                }
+            }
+        }
+    }
+
+    for root in roots {
+        model.set_col_lower(vars[root].active, 1.0);
+    }
+
+    block_cycles(&mut model, &vars, &egraph);
+
+    let solution = model.solve();
+    log::info!(
+        "Dual CBC status {:?}, {:?}, obj = {}",
+        solution.raw().status(),
+        solution.raw().secondary_status(),
+        solution.raw().obj_value(),
+    );
+
+    if solution.raw().status() != coin_cbc::raw::Status::Finished {
+        assert!(timeout_seconds != std::u32::MAX);
+        // NOTE: the fallback optimises area only (not the dual objective).
+        log::info!("Unfinished dual CBC solution; falling back to area-greedy DAG");
+        return super::faster_greedy_dag::FasterGreedyDagExtractor.extract(egraph, roots);
+    }
+
+    let mut result = ExtractionResult::default();
+    for (id, var) in &vars {
+        let active = solution.col(var.active) > 0.0;
+        if active {
+            let node_idx = var
+                .nodes
+                .iter()
+                .position(|&n| solution.col(n) > 0.0)
+                .unwrap();
+            let node_id = egraph[id].nodes[node_idx].clone();
+            result.choose(id.clone(), node_id);
+        }
+    }
+
+    result
+}

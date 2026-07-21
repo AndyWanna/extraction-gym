@@ -189,6 +189,45 @@ impl ExtractionResult {
         costs.values().sum()
     }
 
+    /// Critical-path delay of the extracted DAG: the maximum over root-to-leaf
+    /// paths of the sum of per-node `delay`. Companion to `dag_cost` (which
+    /// sums area). This is the quantity the dual ILP extractor minimises as its
+    /// delay term. Assumes the extraction is acyclic (see `check`); a cycle
+    /// guard keeps it terminating (returning a placeholder) rather than looping.
+    pub fn dag_depth(&self, egraph: &EGraph, roots: &[ClassId]) -> Cost {
+        let mut memo: HashMap<ClassId, Cost> = HashMap::new();
+        roots
+            .iter()
+            .map(|r| self.class_depth(egraph, r, &mut memo))
+            .max()
+            .unwrap_or_default()
+    }
+
+    fn class_depth(
+        &self,
+        egraph: &EGraph,
+        class_id: &ClassId,
+        memo: &mut HashMap<ClassId, Cost>,
+    ) -> Cost {
+        if let Some(d) = memo.get(class_id) {
+            return *d;
+        }
+        // Cycle guard: temporarily record 0 so a back-edge terminates.
+        memo.insert(class_id.clone(), Cost::default());
+        let node = &egraph[&self.choices[class_id]];
+        let mut child_max = Cost::default();
+        for child in &node.children {
+            let cid = egraph.nid_to_cid(child);
+            let d = self.class_depth(egraph, cid, memo);
+            if d > child_max {
+                child_max = d;
+            }
+        }
+        let total = node.delay + child_max;
+        memo.insert(class_id.clone(), total);
+        total
+    }
+
     pub fn node_sum_cost<M>(&self, egraph: &EGraph, node: &Node, costs: &M) -> Cost
     where
         M: MapGet<ClassId, Cost>,

@@ -103,6 +103,22 @@ pub fn extractors() -> IndexMap<&'static str, ExtractorDetail> {
                 use_for_bench: true,
             },
         ),
+        #[cfg(feature = "ilp-cbc")]
+        (
+            "dual-ilp-cbc-timeout",
+            ExtractorDetail {
+                // Minimises alpha*(critical-path delay) + beta*(area). Not a
+                // sum-cost optimum, so Optimal::Neither and off by default in bench.
+                extractor: extract::ilp_cbc::DualCbcExtractor {
+                    timeout_seconds: 10,
+                    alpha: 1.0,
+                    beta: 1.0,
+                }
+                .boxed(),
+                optimal: Optimal::Neither,
+                use_for_bench: false,
+            },
+        ),
     ]
     .into_iter()
     .collect();

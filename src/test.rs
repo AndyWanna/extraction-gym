@@ -59,6 +59,7 @@ pub fn generate_random_egraph() -> EGraph {
             children,
             eclass: eclass.to_string().clone().into(),
             cost: get_semi_random_cost(&nodes),
+            delay: get_semi_random_cost(&nodes),
         });
     }
 
@@ -70,6 +71,7 @@ pub fn generate_random_egraph() -> EGraph {
             children: vec![],
             eclass: rng.gen_range(0..eclass * 2 + 1).to_string().clone().into(),
             cost: get_semi_random_cost(&nodes),
+            delay: get_semi_random_cost(&nodes),
         });
     }
 
