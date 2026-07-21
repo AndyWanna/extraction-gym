@@ -250,16 +250,22 @@ impl Extractor for DualCbcExtractor {
     }
 }
 
-fn extract_dual(
+/// Builds the selection variables/constraints (identical to the sum-cost
+/// `extract`) plus the arrival-time variables `T_c` per e-class with their
+/// big-M constraints:
+///
+///   T_c >= delay_n + T_cc - M*(1 - x_n)   for each child class cc of n
+///   T_c >= delay_n        - M*(1 - x_n)   for childless n
+///
+/// bounded by `0 <= T_c <= S` (S = sum of all delays), which is what makes
+/// `M = 2S` a sound big-M. Shared by every extractor in this module that
+/// needs critical-path delay, so the arrival-time formulation lives in one
+/// place. Returns the class selection vars, the arrival-time column per
+/// class, and `S`.
+fn build_selection_and_arrival(
+    model: &mut Model,
     egraph: &EGraph,
-    roots: &[ClassId],
-    timeout_seconds: u32,
-    alpha: f64,
-    beta: f64,
-) -> ExtractionResult {
-    let mut model = Model::default();
-    model.set_parameter("seconds", &timeout_seconds.to_string());
-
+) -> (IndexMap<ClassId, ClassVars>, IndexMap<ClassId, Col>, f64) {
     let vars: IndexMap<ClassId, ClassVars> = egraph
         .classes()
         .values()
@@ -350,6 +356,21 @@ fn extract_dual(
         }
     }
 
+    (vars, arr, s)
+}
+
+fn extract_dual(
+    egraph: &EGraph,
+    roots: &[ClassId],
+    timeout_seconds: u32,
+    alpha: f64,
+    beta: f64,
+) -> ExtractionResult {
+    let mut model = Model::default();
+    model.set_parameter("seconds", &timeout_seconds.to_string());
+
+    let (vars, arr, s) = build_selection_and_arrival(&mut model, egraph);
+
     // Objective: alpha * t + beta * sum(area * x), where t >= max root arrival.
     model.set_obj_sense(Sense::Minimize);
 
@@ -396,6 +417,107 @@ fn extract_dual(
         assert!(timeout_seconds != std::u32::MAX);
         // NOTE: the fallback optimises area only (not the dual objective).
         log::info!("Unfinished dual CBC solution; falling back to area-greedy DAG");
+        return super::faster_greedy_dag::FasterGreedyDagExtractor.extract(egraph, roots);
+    }
+
+    let mut result = ExtractionResult::default();
+    for (id, var) in &vars {
+        let active = solution.col(var.active) > 0.0;
+        if active {
+            let node_idx = var
+                .nodes
+                .iter()
+                .position(|&n| solution.col(n) > 0.0)
+                .unwrap();
+            let node_id = egraph[id].nodes[node_idx].clone();
+            result.choose(id.clone(), node_id);
+        }
+    }
+
+    result
+}
+
+/* ------------------------------------------------------------------------- */
+/* Delay-budget (area-under-timing-constraint) ILP extractor.                */
+/*                                                                           */
+/* Minimises   sum(area_n * x_n)                                            */
+/* subject to  critical-path delay <= max_delay                             */
+/*                                                                           */
+/* Reuses the arrival-time machinery from `build_selection_and_arrival`.    */
+/* Because delays are non-negative, every active class's arrival time is    */
+/* transitively bounded by whichever root it feeds, so capping every T_c's  */
+/* upper bound at `max_delay` (not just the roots') is sound: it can never  */
+/* cut off a feasible solution, and it makes an unattainable budget surface */
+/* as a provable ILP infeasibility rather than a silently wrong answer.     */
+/* ------------------------------------------------------------------------- */
+
+pub struct DelayBudgetCbcExtractor {
+    /// Solver time limit in seconds (u32::MAX for unbounded).
+    pub timeout_seconds: u32,
+    /// Hard upper bound on the critical-path delay of the extraction.
+    pub max_delay: f64,
+}
+
+impl Extractor for DelayBudgetCbcExtractor {
+    fn extract(&self, egraph: &EGraph, roots: &[ClassId]) -> ExtractionResult {
+        extract_delay_budget(egraph, roots, self.timeout_seconds, self.max_delay)
+    }
+}
+
+fn extract_delay_budget(
+    egraph: &EGraph,
+    roots: &[ClassId],
+    timeout_seconds: u32,
+    max_delay: f64,
+) -> ExtractionResult {
+    let mut model = Model::default();
+    model.set_parameter("seconds", &timeout_seconds.to_string());
+
+    let (vars, arr, s) = build_selection_and_arrival(&mut model, egraph);
+
+    // Tighten every arrival-time variable's upper bound to the budget. This
+    // enforces T_root <= max_delay for every root with no extra rows, and is
+    // sound for every class (see comment above).
+    let budget = max_delay.min(s.max(0.0)).max(0.0);
+    for &t_c in arr.values() {
+        model.set_col_upper(t_c, budget);
+    }
+
+    // Objective: minimise area alone.
+    model.set_obj_sense(Sense::Minimize);
+    for class in egraph.classes().values() {
+        for (node_id, &node_active) in class.nodes.iter().zip(&vars[&class.id].nodes) {
+            let area = node_area(&egraph[node_id]);
+            if area != 0.0 {
+                model.set_obj_coeff(node_active, area);
+            }
+        }
+    }
+
+    for root in roots {
+        model.set_col_lower(vars[root].active, 1.0);
+    }
+
+    block_cycles(&mut model, &vars, &egraph);
+
+    let solution = model.solve();
+    log::info!(
+        "Delay-budget CBC status {:?}, {:?}, obj = {}",
+        solution.raw().status(),
+        solution.raw().secondary_status(),
+        solution.raw().obj_value(),
+    );
+
+    if solution.raw().is_proven_infeasible() {
+        log::info!("Infeasible, returning empty solution");
+        return ExtractionResult::default();
+    }
+
+    if solution.raw().status() != coin_cbc::raw::Status::Finished {
+        assert!(timeout_seconds != std::u32::MAX);
+        // NOTE: the fallback optimises area only and ignores max_delay
+        // entirely, so it is not guaranteed to respect the delay budget.
+        log::info!("Unfinished delay-budget CBC solution; falling back to area-greedy DAG");
         return super::faster_greedy_dag::FasterGreedyDagExtractor.extract(egraph, roots);
     }
 

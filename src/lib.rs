@@ -119,6 +119,23 @@ pub fn extractors() -> IndexMap<&'static str, ExtractorDetail> {
                 use_for_bench: false,
             },
         ),
+        #[cfg(feature = "ilp-cbc")]
+        (
+            "delay-budget-ilp-cbc-timeout",
+            ExtractorDetail {
+                // Minimises area subject to critical-path delay <= max_delay.
+                // max_delay is a fixed placeholder for benchmarking purposes
+                // only -- it is arbitrary and may be infeasible or slack
+                // depending on the egraph under test.
+                extractor: extract::ilp_cbc::DelayBudgetCbcExtractor {
+                    timeout_seconds: 10,
+                    max_delay: 100.0,
+                }
+                .boxed(),
+                optimal: Optimal::Neither,
+                use_for_bench: false,
+            },
+        ),
     ]
     .into_iter()
     .collect();
