@@ -478,6 +478,13 @@ fn extract_delay_budget(
     // Tighten every arrival-time variable's upper bound to the budget. This
     // enforces T_root <= max_delay for every root with no extra rows, and is
     // sound for every class (see comment above).
+    //
+    // NB: a tighter *big-M* of D_max + budget (vs the loose 2S) is exact in
+    // real arithmetic but NUMERICALLY UNSOUND with the current delay=area
+    // placeholder: boolean/unmapped nodes carry the BIG=1e9 area sentinel as
+    // their delay, so D_max=1e9 and the arrival rows mix a 1e9 coefficient with
+    // an O(budget) RHS, which CBC's tolerances mis-handle (it returned a
+    // provably worse "optimum"). Revisit once a real, O(1) delay model exists.
     let budget = max_delay.min(s.max(0.0)).max(0.0);
     for &t_c in arr.values() {
         model.set_col_upper(t_c, budget);
