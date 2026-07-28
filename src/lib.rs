@@ -80,7 +80,10 @@ pub fn extractors() -> IndexMap<&'static str, ExtractorDetail> {
         (
             "ilp-cbc",
             ExtractorDetail {
-                extractor: extract::ilp_cbc::CbcExtractor.boxed(),
+                extractor: extract::ilp_cbc::CbcExtractor {
+                    timeout_seconds: u32::MAX,
+                }
+                .boxed(),
                 optimal: Optimal::Dag,
                 use_for_bench: false, // takes >10 hours sometimes
             },
@@ -98,7 +101,10 @@ pub fn extractors() -> IndexMap<&'static str, ExtractorDetail> {
         (
             "faster-ilp-cbc",
             ExtractorDetail {
-                extractor: extract::faster_ilp_cbc::FasterCbcExtractor.boxed(),
+                extractor: extract::faster_ilp_cbc::FasterCbcExtractor {
+                    timeout_seconds: u32::MAX,
+                }
+                .boxed(),
                 optimal: Optimal::Dag,
                 use_for_bench: true,
             },

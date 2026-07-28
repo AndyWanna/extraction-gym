@@ -181,11 +181,14 @@ impl<const TIMEOUT_IN_SECONDS: u32> Extractor
     }
 }
 
-pub struct FasterCbcExtractor;
+pub struct FasterCbcExtractor {
+    /// Solver time limit in seconds (`u32::MAX` for unbounded).
+    pub timeout_seconds: u32,
+}
 
 impl Extractor for FasterCbcExtractor {
     fn extract(&self, egraph: &EGraph, roots: &[ClassId]) -> ExtractionResult {
-        return extract(egraph, roots, &Config::default(), std::u32::MAX);
+        return extract(egraph, roots, &Config::default(), self.timeout_seconds);
     }
 }
 
