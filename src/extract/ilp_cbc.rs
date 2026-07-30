@@ -260,14 +260,19 @@ impl Extractor for DualCbcExtractor {
 ///   T_c >= delay_n + T_cc - M*(1 - x_n)   for each child class cc of n
 ///   T_c >= delay_n        - M*(1 - x_n)   for childless n
 ///
-/// bounded by `0 <= T_c <= S` (S = sum of all delays), which is what makes
-/// `M = 2S` a sound big-M. Shared by every extractor in this module that
-/// needs critical-path delay, so the arrival-time formulation lives in one
-/// place. Returns the class selection vars, the arrival-time column per
-/// class, and `S`.
+/// bounded by `0 <= T_c <= S` (S = sum of all delays). The big-M is chosen by
+/// the caller-supplied `big_m_fn(s, d_max)` where `s` = sum of all node delays
+/// and `d_max` = the max single-node delay: the loose but always-sound `2S`
+/// (`|s, _| 2*s`, used by `dual`, whose arrival cols keep their `[0, S]` bound),
+/// or the tight `budget + d_max` (used by `delay_budget`, which re-caps every
+/// arrival col at `budget`, so `M >= budget + max(node_delay)` is exactly the
+/// sound bound — see the arrival-row derivation). Shared by every extractor in
+/// this module that needs critical-path delay. Returns the class selection
+/// vars, the arrival-time column per class, and `S`.
 fn build_selection_and_arrival(
     model: &mut Model,
     egraph: &EGraph,
+    big_m_fn: impl Fn(f64, f64) -> f64,
 ) -> (IndexMap<ClassId, ClassVars>, IndexMap<ClassId, Col>, f64) {
     let vars: IndexMap<ClassId, ClassVars> = egraph
         .classes()
@@ -318,7 +323,18 @@ fn build_selection_and_arrival(
         .flat_map(|c| c.nodes.iter())
         .map(|nid| node_delay(&egraph[nid]))
         .sum();
-    let big_m = if s > 0.0 { 2.0 * s } else { 1.0 };
+    // Max single-node delay: the physical quantity the tight big-M scales with
+    // (bounded by the biggest library cell, unlike S which grows with #nodes).
+    let d_max: f64 = egraph
+        .classes()
+        .values()
+        .flat_map(|c| c.nodes.iter())
+        .map(|nid| node_delay(&egraph[nid]))
+        .fold(0.0_f64, f64::max);
+    let big_m = {
+        let m = big_m_fn(s, d_max);
+        if m > 0.0 { m } else { 1.0 }
+    };
 
     let arr: IndexMap<ClassId, Col> = vars
         .keys()
@@ -372,7 +388,8 @@ fn extract_dual(
     let mut model = Model::default();
     model.set_parameter("seconds", &timeout_seconds.to_string());
 
-    let (vars, arr, s) = build_selection_and_arrival(&mut model, egraph);
+    // Dual keeps arrival cols on their [0, S] bound, so the sound big-M is 2S.
+    let (vars, arr, s) = build_selection_and_arrival(&mut model, egraph, |s, _d_max| 2.0 * s);
 
     // Objective: alpha * t + beta * sum(area * x), where t >= max root arrival.
     model.set_obj_sense(Sense::Minimize);
@@ -476,19 +493,33 @@ fn extract_delay_budget(
     let mut model = Model::default();
     model.set_parameter("seconds", &timeout_seconds.to_string());
 
-    let (vars, arr, s) = build_selection_and_arrival(&mut model, egraph);
+    // Tight, well-conditioned big-M: since we cap every arrival col at `budget`
+    // (below), the sound bound for the arrival relaxation is exactly
+    // `M = budget + D_max` (D_max = max single-node delay ~ the biggest library
+    // cell, NOT a path delay). With real per-gate delays on every node (the
+    // boolean-op primitives now carry their AN2/OR2/XOR2/INV delays instead of a
+    // 1e4/1e9 sentinel), D_max is physical (~100 ps), so this M is ~1x the RHS
+    // scale and CBC's tolerances stay well-conditioned — unlike the loose 2S,
+    // whose S was inflated by the old sentinels into a ~1e7 coefficient.
+    let (vars, arr, s) = build_selection_and_arrival(&mut model, egraph, |s, d_max| {
+        let budget = max_delay.min(s.max(0.0)).max(0.0);
+        budget + d_max
+    });
 
     // Tighten every arrival-time variable's upper bound to the budget. This
     // enforces T_root <= max_delay for every root with no extra rows, and is
     // sound for every class (see comment above).
-    //
-    // NB: a tighter *big-M* of D_max + budget (vs the loose 2S) is exact in
-    // real arithmetic but NUMERICALLY UNSOUND with the current delay=area
-    // placeholder: boolean/unmapped nodes carry the BIG=1e9 area sentinel as
-    // their delay, so D_max=1e9 and the arrival rows mix a 1e9 coefficient with
-    // an O(budget) RHS, which CBC's tolerances mis-handle (it returned a
-    // provably worse "optimum"). Revisit once a real, O(1) delay model exists.
     let budget = max_delay.min(s.max(0.0)).max(0.0);
+    let d_max: f64 = egraph
+        .classes()
+        .values()
+        .flat_map(|c| c.nodes.iter())
+        .map(|nid| node_delay(&egraph[nid]))
+        .fold(0.0_f64, f64::max);
+    log::info!(
+        "Delay-budget: S={:.2}, D_max={:.2}, budget={:.2} (max_delay={:.2}), big_M={:.2}",
+        s, d_max, budget, max_delay, budget + d_max,
+    );
     for &t_c in arr.values() {
         model.set_col_upper(t_c, budget);
     }
