@@ -3,3 +3,5 @@ out.csv
 out.tsv
 output/
 out.json
+# `grb` hardcodes this filename into the CWD whenever it creates a Gurobi env.
+gurobi.log

@@ -1,4 +1,16 @@
 /*
+Not the default DAG-area extractor any more; see ilp_cbc::IlpExtractor.
+
+The lazy cycle loop below discards any timed-out solution that still contains a
+cycle, so at a short time cap it returns the greedy seed almost every time.
+ilp_cbc encodes a topological order up front, so every feasible solution is
+acyclic by construction.
+
+Also note `initial_result` below is exgym's own area-greedy, used here as the
+seed, the acceptance bar AND `remove_high_cost`'s pruning bound. It is unbounded
+in how much worse than the caller's input mapping it can be. `ilp_cbc` no longer
+computes a greedy of any kind; do not copy this pattern back.
+
 Produces a dag-cost optimal extraction of an Egraph.
 
 This can take >10 hours to run on some egraphs, so there's the option to provide a timeout.
@@ -47,11 +59,12 @@ we get an optimal solution without cycles.
 
 */
 
+use super::warm::{SolveReport, WarmStartMode};
 use super::*;
-use coin_cbc::{Col, Model};
+use crate::milp::{DefaultMilp, MilpModel, MilpSolution};
 use indexmap::IndexSet;
 use std::fmt;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 #[derive(Debug)]
 pub struct Config {
@@ -88,24 +101,24 @@ impl Config {
     }
 }
 
-struct NodeILP {
-    variable: Col,
+struct NodeILP<C> {
+    variable: C,
     cost: Cost,
     member: NodeId,
     children_classes: IndexSet<ClassId>,
 }
 
-struct ClassILP {
-    active: Col,
+struct ClassILP<C> {
+    active: C,
     members: Vec<NodeId>,
-    variables: Vec<Col>,
+    variables: Vec<C>,
     costs: Vec<Cost>,
     // Initially this contains the children of each member (respectively), but
     // gets edited during the run, so mightn't match later on.
     childrens_classes: Vec<IndexSet<ClassId>>,
 }
 
-impl fmt::Debug for ClassILP {
+impl<C: Copy> fmt::Debug for ClassILP<C> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
@@ -118,7 +131,7 @@ impl fmt::Debug for ClassILP {
     }
 }
 
-impl ClassILP {
+impl<C: Copy> ClassILP<C> {
     fn remove(&mut self, idx: usize) {
         self.variables.remove(idx);
         self.costs.remove(idx);
@@ -142,7 +155,7 @@ impl ClassILP {
         assert_eq!(self.variables.len(), self.childrens_classes.len());
     }
 
-    fn as_nodes(&self) -> Vec<NodeILP> {
+    fn as_nodes(&self) -> Vec<NodeILP<C>> {
         self.variables
             .iter()
             .zip(&self.costs)
@@ -162,7 +175,8 @@ impl ClassILP {
         &self.childrens_classes[idx]
     }
 
-    fn get_variable_for_node(&self, node_id: &NodeId) -> Option<Col> {
+    #[allow(dead_code)]
+    fn get_variable_for_node(&self, node_id: &NodeId) -> Option<C> {
         if let Some(idx) = self.members.iter().position(|n| n == node_id) {
             return Some(self.variables[idx]);
         }
@@ -170,34 +184,160 @@ impl ClassILP {
     }
 }
 
-pub struct FasterCbcExtractorWithTimeout<const TIMEOUT_IN_SECONDS: u32>;
+/// Warm-start configuration shared by every ILP extractor in this crate.
+///
+/// Kept as one field on the extractor structs rather than two, so adding warm
+/// starts did not turn every struct-literal construction site into a churn
+/// point (`..Default::default()` covers it).
+#[derive(Default, Clone)]
+pub struct WarmConfig {
+    /// Which starting incumbent to use.
+    pub mode: WarmStartMode,
+    /// The caller-supplied "initial" extraction for [`WarmStartMode::Initial`],
+    /// expressed over the same serialized e-graph the extractor is given.
+    /// `None` with `mode == Initial` degrades to `Greedy` with a note.
+    pub seed: Option<ExtractionResult>,
+    /// Where to write the solver's own log, enabling the incumbent-vs-time
+    /// trajectory. `None` keeps the solver silent (the historical behaviour).
+    pub milp_log: Option<String>,
+}
+
+/// Simplifying DAG-optimal ILP extractor with a compile-time timeout.
+/// Backend-generic; [`FasterCbcExtractorWithTimeout`] is the legacy spelling.
+pub struct FasterIlpExtractorWithTimeout<const TIMEOUT_IN_SECONDS: u32>;
+
+/// Legacy name for [`FasterIlpExtractorWithTimeout`].
+/// NOTE: a type alias to a *unit* struct cannot be used in expression position
+/// (`FasterCbcExtractorWithTimeout::<10>` as a value is rejected by rustc), so
+/// construct it with `::new()` or use the neutral name directly.
+pub type FasterCbcExtractorWithTimeout<const TIMEOUT_IN_SECONDS: u32> =
+    FasterIlpExtractorWithTimeout<TIMEOUT_IN_SECONDS>;
 
 // Some problems take >36,000 seconds to optimise.
 impl<const TIMEOUT_IN_SECONDS: u32> Extractor
-    for FasterCbcExtractorWithTimeout<TIMEOUT_IN_SECONDS>
+    for FasterIlpExtractorWithTimeout<TIMEOUT_IN_SECONDS>
 {
     fn extract(&self, egraph: &EGraph, roots: &[ClassId]) -> ExtractionResult {
-        return extract(egraph, roots, &Config::default(), TIMEOUT_IN_SECONDS);
+        return extract::<DefaultMilp>(
+            egraph,
+            roots,
+            &Config::default(),
+            TIMEOUT_IN_SECONDS,
+            1,
+            &WarmConfig::default(),
+        )
+        .0;
     }
 }
 
-pub struct FasterCbcExtractor {
+impl<const TIMEOUT_IN_SECONDS: u32> FasterIlpExtractorWithTimeout<TIMEOUT_IN_SECONDS> {
+    /// Constructor, so the type aliases can also be used in expression
+    /// position (`FasterCbcExtractorWithTimeout::<10>::new()`).
+    pub const fn new() -> Self {
+        Self
+    }
+
+    /// Same as [`Extractor::extract`], but with the MILP backend pinned.
+    pub fn extract_with<M: MilpModel>(
+        &self,
+        egraph: &EGraph,
+        roots: &[ClassId],
+    ) -> ExtractionResult {
+        extract::<M>(
+            egraph,
+            roots,
+            &Config::default(),
+            TIMEOUT_IN_SECONDS,
+            1,
+            &WarmConfig::default(),
+        )
+        .0
+    }
+}
+
+/// Simplifying DAG-optimal ILP extractor with a runtime timeout.
+/// Backend-generic; [`FasterCbcExtractor`] is the legacy spelling.
+pub struct FasterIlpExtractor {
     /// Solver time limit in seconds (`u32::MAX` for unbounded).
+    ///
+    /// NOTE: `u32::MAX` really does mean "run until it finishes", which on a
+    /// hard instance means "hang". Callers that cannot supervise the process
+    /// must pass a real limit.
     pub timeout_seconds: u32,
+    /// Solver threads for each solve. `1` unless the caller opted in; see
+    /// [`MilpModel::set_threads`] for the slot-allocation invariant.
+    pub threads: u32,
+    /// Warm start + solver-log configuration. Defaults to "no MIP start,
+    /// no log", i.e. exactly the historical behaviour.
+    pub warm: WarmConfig,
 }
 
-impl Extractor for FasterCbcExtractor {
-    fn extract(&self, egraph: &EGraph, roots: &[ClassId]) -> ExtractionResult {
-        return extract(egraph, roots, &Config::default(), self.timeout_seconds);
+impl Default for FasterIlpExtractor {
+    fn default() -> Self {
+        FasterIlpExtractor {
+            timeout_seconds: u32::MAX,
+            threads: 1,
+            warm: WarmConfig::default(),
+        }
     }
 }
 
-fn extract(
+/// Legacy name for [`FasterIlpExtractor`].
+pub type FasterCbcExtractor = FasterIlpExtractor;
+
+impl Extractor for FasterIlpExtractor {
+    fn extract(&self, egraph: &EGraph, roots: &[ClassId]) -> ExtractionResult {
+        return extract::<DefaultMilp>(
+            egraph,
+            roots,
+            &Config::default(),
+            self.timeout_seconds,
+            self.threads,
+            &self.warm,
+        )
+        .0;
+    }
+}
+
+impl FasterIlpExtractor {
+    /// Same as [`Extractor::extract`], but with the MILP backend pinned.
+    pub fn extract_with<M: MilpModel>(
+        &self,
+        egraph: &EGraph,
+        roots: &[ClassId],
+    ) -> ExtractionResult {
+        self.extract_with_report::<M>(egraph, roots).0
+    }
+
+    /// Same as [`Self::extract_with`], but also returns the [`SolveReport`]:
+    /// backend, threads, timeout, warm start *as applied*, solver status,
+    /// objective, bound, gap and (with `warm.milp_log` set) the
+    /// incumbent-vs-time trajectory.
+    pub fn extract_with_report<M: MilpModel>(
+        &self,
+        egraph: &EGraph,
+        roots: &[ClassId],
+    ) -> (ExtractionResult, SolveReport) {
+        extract::<M>(
+            egraph,
+            roots,
+            &Config::default(),
+            self.timeout_seconds,
+            self.threads,
+            &self.warm,
+        )
+    }
+}
+
+fn extract<M: MilpModel>(
     egraph: &EGraph,
     roots_slice: &[ClassId],
     config: &Config,
     timeout: u32,
-) -> ExtractionResult {
+    threads: u32,
+    warm: &WarmConfig,
+) -> (ExtractionResult, SolveReport) {
+    let mut report = SolveReport::new(M::NAME, "area-ilp", threads, timeout, warm.mode);
     // todo from now on we don't use roots_slice - be good to prevent using it any more.
     let mut roots = roots_slice.to_vec();
     roots.sort();
@@ -205,13 +345,20 @@ fn extract(
 
     let simp_start_time = std::time::Instant::now();
 
-    let mut model = Model::default();
+    let mut model = M::new();
     //silence verbose stdout output
-    model.set_parameter("loglevel", "0");
+    model.set_log_level(0);
+    model.set_threads(threads);
+    // ... unless a trajectory was asked for, in which case route the solver's
+    // own log to a file (still nothing on stdout). See `MilpModel::set_log_file`.
+    if let Some(path) = &warm.milp_log {
+        model.set_log_file(path);
+        report.milp_log = Some(path.clone());
+    }
 
     let n2c = |nid: &NodeId| egraph.nid_to_cid(nid);
 
-    let mut vars: IndexMap<ClassId, ClassILP> = egraph
+    let mut vars: IndexMap<ClassId, ClassILP<M::Col>> = egraph
         .classes()
         .values()
         .map(|class| {
@@ -238,6 +385,10 @@ fn extract(
 
     let initial_result = super::faster_greedy_dag::FasterGreedyDagExtractor.extract(egraph, &roots);
     let initial_result_cost = initial_result.dag_cost(egraph, &roots);
+    // Reported unconditionally: on timeout the extractor may return this
+    // instead of the solver's answer, and a reader who cannot tell the two
+    // apart would mistake "greedy" for "what the solver achieved".
+    report.initial_cost = Some(initial_result_cost.into_inner());
 
     // For classes where we know the choice already, we set the nodes early.
     let mut result = ExtractionResult::default();
@@ -260,7 +411,8 @@ fn extract(
         if class.members() == 0 {
             if roots.contains(classid) {
                 log::info!("Infeasible, root has no possible children, returning empty solution");
-                return ExtractionResult::default();
+                report.status = Some(crate::milp::MilpStatus::Infeasible);
+                return (ExtractionResult::default(), report);
             }
 
             model.set_col_upper(class.active, 0.0);
@@ -284,7 +436,7 @@ fn extract(
         let childrens_classes_var =
             |cc: &IndexSet<ClassId>| cc.iter().map(|n| vars[n].active).collect::<IndexSet<_>>();
 
-        let mut intersection: IndexSet<Col> = Default::default();
+        let mut intersection: IndexSet<M::Col> = Default::default();
 
         if config.take_intersection_of_children_in_class {
             // otherwise the intersection is empty (i.e. disabled.)
@@ -362,15 +514,67 @@ fn extract(
 
     log::info!("Objective function terms: {}", objective_fn_terms);
 
-    if false {
-        //config.initialise_with_approx
-        // set initial solution based on a non-optimal extraction.
-        // using this causes the ILP solver to return unsound results.
-        set_initial_solution(&vars, &mut model, &initial_result);
-    }
-
-    if false {
-        return initial_result;
+    // -- warm start -----------------------------------------------------------
+    //
+    // For the AREA model every complete acyclic selection is feasible (there is
+    // no side constraint to violate), so the only way to seed an infeasible
+    // point is to seed an *incomplete* or *inconsistent* one — which is exactly
+    // what the old `if false`-gated code did, because it walked the greedy
+    // result against the SIMPLIFIED `vars` without checking that the chosen
+    // node survived simplification. `seed_simplified` rebuilds the selection
+    // against `vars` itself and refuses if it cannot.
+    if warm.mode != WarmStartMode::None {
+        if !model.supports_warm_start() {
+            report.refuse_warm_start(format!(
+                "{} does not support a trustworthy MIP start (see CbcModel::supports_warm_start)",
+                M::NAME
+            ));
+        } else {
+            let (candidate, effective, mut note) = match warm.mode {
+                WarmStartMode::Greedy => (&initial_result, WarmStartMode::Greedy, None),
+                WarmStartMode::Initial => match &warm.seed {
+                    Some(s) => (s, WarmStartMode::Initial, None),
+                    None => (
+                        &initial_result,
+                        WarmStartMode::Greedy,
+                        Some(
+                            "no initial extraction was supplied; degraded to the greedy seed"
+                                .to_string(),
+                        ),
+                    ),
+                },
+                WarmStartMode::None => unreachable!(),
+            };
+            match seed_simplified(&vars, &roots, candidate, &initial_result) {
+                Ok((assignment, repaired)) => {
+                    // Report the cost of the seed AS APPLIED (post-repair), not
+                    // of the raw candidate: with repairs those are different
+                    // numbers, and the one that explains the solver's starting
+                    // incumbent is the applied one. `result` already holds the
+                    // classes `remove_single_zero_cost` decided up front, which
+                    // are no longer in `vars`.
+                    let mut applied = result.clone();
+                    for (cid, &idx) in &assignment {
+                        applied.choose(cid.clone(), vars[cid].members[idx].clone());
+                    }
+                    report.warm_start_objective =
+                        super::warm::try_dag_cost(egraph, &roots, &applied);
+                    apply_seed(&vars, &mut model, &assignment);
+                    if repaired > 0 {
+                        let extra = format!(
+                            "{repaired} class(es) repaired off the preferred node \
+                             (removed by simplification or re-classed)"
+                        );
+                        note = Some(match note {
+                            Some(n) => format!("{n}; {extra}"),
+                            None => extra,
+                        });
+                    }
+                    report.accept_warm_start(effective, note);
+                }
+                Err(why) => report.refuse_warm_start(why),
+            }
+        }
     }
 
     log::info!(
@@ -379,45 +583,53 @@ fn extract(
     );
 
     let start_time = SystemTime::now();
+    let solve_clock = Instant::now();
 
     loop {
         // Set the solver limit based on how long has passed already.
         if let Ok(difference) = SystemTime::now().duration_since(start_time) {
             let seconds = timeout.saturating_sub(difference.as_secs().try_into().unwrap());
-            model.set_parameter("seconds", &seconds.to_string());
+            model.set_time_limit_seconds(seconds);
         } else {
-            model.set_parameter("seconds", "0");
+            model.set_time_limit_seconds(0);
         }
 
         //This starts from scratch solving each time. I've looked quickly
         //at the API and didn't see how to call it incrementally.
         let solution = model.solve();
+        report.num_solves += 1;
+        report.solve_wall_secs = solve_clock.elapsed().as_secs_f64();
+        report.record_solution(&solution);
         log::info!(
-            "CBC status {:?}, {:?}, obj = {}",
-            solution.raw().status(),
-            solution.raw().secondary_status(),
-            solution.raw().obj_value(),
+            "{} status {}, obj = {}",
+            M::NAME,
+            solution.status_detail(),
+            solution.obj_value(),
         );
 
-        if solution.raw().is_proven_infeasible() {
+        if solution.is_infeasible() {
             log::info!("Infeasible, returning empty solution");
-            return ExtractionResult::default();
+            report.load_trajectory();
+            return (ExtractionResult::default(), report);
         }
 
-        let stopped_without_finishing = solution.raw().status() != coin_cbc::raw::Status::Finished;
+        let stopped_without_finishing = !solution.ran_to_completion();
 
         if stopped_without_finishing {
-            log::info!("CBC stopped before finishing");
+            log::info!("{} stopped before finishing", M::NAME);
 
             if !config.return_improved_on_timeout
-                || solution.raw().obj_value() > initial_result_cost.into_inner()
+                || solution.obj_value() > initial_result_cost.into_inner()
             {
                 log::info!(
-                    "Unfinished CBC solution returned, solver: {}, initial: {}",
-                    solution.raw().obj_value(),
+                    "Unfinished {} solution returned, solver: {}, initial: {}",
+                    M::NAME,
+                    solution.obj_value(),
                     initial_result_cost
                 );
-                return initial_result;
+                report.returned_fallback = true;
+                report.load_trajectory();
+                return (initial_result, report);
             }
         }
 
@@ -455,10 +667,11 @@ fn extract(
         log::info!("Cost of solution {cost}");
         log::info!("Initial result {}", initial_result_cost.into_inner());
         log::info!("Cost of extraction {}", result.dag_cost(egraph, &roots));
-        log::info!("Cost from solver {}", solution.raw().obj_value());
+        log::info!("Cost from solver {}", solution.obj_value());
 
         if stopped_without_finishing {
             log::info!("Timed out");
+            report.load_trajectory();
             if cycles.is_empty() {
                 // The reported cost of the solution sometimes differs to the dag cost, so we're
                 // a bit carefu..
@@ -471,22 +684,25 @@ fn extract(
                         "Returning result of incomplete search saving: {}",
                         initial_result_cost - extraction_dag_cost
                     );
-                    return result;
+                    return (result, report);
                 } else {
-                    return initial_result;
+                    report.returned_fallback = true;
+                    return (initial_result, report);
                 }
             } else {
                 log::info!("Found cycle in solution, but solver timed out");
-                return initial_result;
+                report.returned_fallback = true;
+                return (initial_result, report);
             }
         }
 
         if cycles.is_empty() {
             assert!(cost <= initial_result_cost.into_inner() + EPSILON_ALLOWANCE);
             assert!((result.dag_cost(egraph, &roots) - cost).abs() < EPSILON_ALLOWANCE);
-            assert!((cost - solution.raw().obj_value()).abs() < EPSILON_ALLOWANCE);
+            assert!((cost - solution.obj_value()).abs() < EPSILON_ALLOWANCE);
 
-            return result;
+            report.load_trajectory();
+            return (result, report);
         } else {
             log::info!("Refining by blocking cycles: {}", cycles.len());
             for c in &cycles {
@@ -494,44 +710,137 @@ fn extract(
             }
         }
 
-        if false {
-            //config.initialise_with_previous_solution
-
-            // This is a bit complicated.
-
-            //First, The COIN-OR CBC interface has this function
-            //model.set_initial_solution(&solution);
-            //But it crashes if the model has more columns than the solution does, which
-            //happens if we've just blocked cycles.
-
-            // Second, when used before solving, the ILP solver was sometimes unsound.
-            // I didn't see unsound results from the ILP solver using this function here, but
-            // it makes me wary, plus it doesn't speed up things noticeably.
-            set_initial_solution(&vars, &mut model, &result);
-        }
+        // NOTE: no re-seed here. `MilpModel::set_initial_solution` takes a
+        // solution of the *previous* model, and `block_cycle` has just added
+        // columns; CBC's version segfaults on that mismatch, and the seed would
+        // in any case be the solution the solver already has. The MIP start set
+        // before the first solve is the one that matters.
     }
 }
 
-/*
-Using this caused wrong results from the solver. I don't have a good idea why.
-*/
-fn set_initial_solution(
-    vars: &IndexMap<ClassId, ClassILP>,
-    model: &mut Model,
-    initial_result: &ExtractionResult,
-) {
-    for (class, class_vars) in vars {
-        for col in class_vars.variables.clone() {
-            model.set_col_initial_solution(col, 0.0);
-        }
+/// Build a complete, model-consistent seed against the **simplified** `vars`.
+///
+/// This is the piece the original code was missing. `vars` is not the e-graph:
+/// nodes have been deleted and children sets rewritten (`pull_up_with_single_
+/// parent` *adds* a class's descendants to its parent's child set). So a seed
+/// has to be constructed by walking `vars` itself — committing to a node, then
+/// descending through *that node's* `childrens_classes` — which makes it
+/// satisfy the "node active implies child active" and the intersection rows by
+/// construction. Seeding from the e-graph's own structure instead, as the old
+/// code did, produces a point that violates rows the solver is about to add.
+///
+/// Returns the per-class `(active, chosen index)` assignment and how many
+/// classes had to be repaired off the preferred choice. `Err` means "do not
+/// warm start": every error case here would be an infeasible point.
+type SeedAssignment = IndexMap<ClassId, usize>;
 
-        if let Some(node_id) = initial_result.choices.get(class) {
-            model.set_col_initial_solution(class_vars.active, 1.0);
-            if let Some(var) = vars[class].get_variable_for_node(node_id) {
-                model.set_col_initial_solution(var, 1.0);
+fn seed_simplified<C: Copy>(
+    vars: &IndexMap<ClassId, ClassILP<C>>,
+    roots: &[ClassId],
+    preferred: &ExtractionResult,
+    fallback: &ExtractionResult,
+) -> Result<(SeedAssignment, usize), String> {
+    let mut chosen: SeedAssignment = IndexMap::default();
+    let mut repaired = 0usize;
+    let mut todo: Vec<ClassId> = roots.to_vec();
+    // `Doing`/`Done` colouring, to reject a cyclic seed rather than loop.
+    let mut done: FxHashSet<ClassId> = Default::default();
+
+    while let Some(cid) = todo.pop() {
+        if !done.insert(cid.clone()) {
+            continue;
+        }
+        let class = vars
+            .get(&cid)
+            .ok_or_else(|| format!("seed reached class {cid}, which simplification removed"))?;
+        if class.members() == 0 {
+            return Err(format!(
+                "seed reached class {cid}, which has no remaining members (it is pinned inactive)"
+            ));
+        }
+        // Prefer the seed's node, then the fallback's, then the cheapest
+        // survivor. Every one of those is feasible for a pure-area model.
+        let idx = preferred
+            .choices
+            .get(&cid)
+            .and_then(|nid| class.members.iter().position(|m| m == nid))
+            .or_else(|| {
+                repaired += 1;
+                fallback
+                    .choices
+                    .get(&cid)
+                    .and_then(|nid| class.members.iter().position(|m| m == nid))
+            })
+            .or_else(|| {
+                class
+                    .costs
+                    .iter()
+                    .enumerate()
+                    .min_by(|a, b| a.1.cmp(b.1))
+                    .map(|(i, _)| i)
+            })
+            .ok_or_else(|| format!("no seedable member for class {cid}"))?;
+
+        for child in &class.childrens_classes[idx] {
+            todo.push(child.clone());
+        }
+        chosen.insert(cid, idx);
+    }
+
+    // Acyclicity, checked over the simplified children sets the model uses.
+    if seed_has_cycle(vars, roots, &chosen) {
+        return Err("candidate seed selection contains a cycle".to_string());
+    }
+    Ok((chosen, repaired))
+}
+
+fn seed_has_cycle<C: Copy>(
+    vars: &IndexMap<ClassId, ClassILP<C>>,
+    roots: &[ClassId],
+    chosen: &SeedAssignment,
+) -> bool {
+    fn dfs<C: Copy>(
+        vars: &IndexMap<ClassId, ClassILP<C>>,
+        chosen: &SeedAssignment,
+        cid: &ClassId,
+        state: &mut IndexMap<ClassId, u8>,
+    ) -> bool {
+        match state.get(cid) {
+            Some(2) => return false,
+            Some(_) => return true,
+            None => {}
+        }
+        state.insert(cid.clone(), 1);
+        if let (Some(class), Some(&idx)) = (vars.get(cid), chosen.get(cid)) {
+            for child in &class.childrens_classes[idx] {
+                if dfs(vars, chosen, child, state) {
+                    return true;
+                }
             }
-        } else {
-            model.set_col_initial_solution(class_vars.active, 0.0);
+        }
+        state.insert(cid.clone(), 2);
+        false
+    }
+    let mut state: IndexMap<ClassId, u8> = IndexMap::default();
+    roots.iter().any(|r| dfs(vars, chosen, r, &mut state))
+}
+
+/// Push a validated [`SeedAssignment`] into the model as a MIP start. Every
+/// column of the selection model gets an explicit value (including the zeros),
+/// so no backend has to guess at an unspecified variable.
+fn apply_seed<M: MilpModel>(
+    vars: &IndexMap<ClassId, ClassILP<M::Col>>,
+    model: &mut M,
+    chosen: &SeedAssignment,
+) {
+    for (class_id, class_vars) in vars {
+        let active = chosen.get(class_id).copied();
+        model.set_col_initial_solution(
+            class_vars.active,
+            if active.is_some() { 1.0 } else { 0.0 },
+        );
+        for (i, col) in class_vars.variables.iter().enumerate() {
+            model.set_col_initial_solution(*col, if active == Some(i) { 1.0 } else { 0.0 });
         }
     }
 }
@@ -549,8 +858,8 @@ This is really like deleting empty classes, except there we delete the parent cl
 and here we delete just children of nodes in the parent classes.
 
 */
-fn remove_single_zero_cost(
-    vars: &mut IndexMap<ClassId, ClassILP>,
+fn remove_single_zero_cost<C: Copy>(
+    vars: &mut IndexMap<ClassId, ClassILP<C>>,
     extraction_result: &mut ExtractionResult,
     roots: &[ClassId],
     config: &Config,
@@ -614,7 +923,9 @@ fn remove_single_zero_cost(
     }
 }
 
-fn child_to_parents(vars: &IndexMap<ClassId, ClassILP>) -> IndexMap<ClassId, IndexSet<ClassId>> {
+fn child_to_parents<C: Copy>(
+    vars: &IndexMap<ClassId, ClassILP<C>>,
+) -> IndexMap<ClassId, IndexSet<ClassId>> {
     let mut child_to_parents: IndexMap<ClassId, IndexSet<ClassId>> = IndexMap::new();
 
     for (class_id, class_vars) in vars.iter() {
@@ -633,7 +944,10 @@ fn child_to_parents(vars: &IndexMap<ClassId, ClassILP>) -> IndexMap<ClassId, Ind
 /* If a node in a class has (a) equal or higher cost compared to another in that same class, and (b) its
   children are a superset of the other's, then it can be removed.
 */
-fn remove_more_expensive_subsumed_nodes(vars: &mut IndexMap<ClassId, ClassILP>, config: &Config) {
+fn remove_more_expensive_subsumed_nodes<C: Copy>(
+    vars: &mut IndexMap<ClassId, ClassILP<C>>,
+    config: &Config,
+) {
     if config.remove_more_expensive_subsumed_nodes {
         let mut removed = 0;
 
@@ -666,8 +980,8 @@ fn remove_more_expensive_subsumed_nodes(vars: &mut IndexMap<ClassId, ClassILP>, 
 }
 
 // Remove any classes that can't be reached from a root.
-fn remove_unreachable_classes(
-    vars: &mut IndexMap<ClassId, ClassILP>,
+fn remove_unreachable_classes<C: Copy>(
+    vars: &mut IndexMap<ClassId, ClassILP<C>>,
     roots: &[ClassId],
     config: &Config,
 ) {
@@ -682,7 +996,7 @@ fn remove_unreachable_classes(
 
 // Any node that has an empty class as a child, can't be selected, so remove the node,
 // if that makes another empty class, then remove its parents
-fn remove_empty_classes(vars: &mut IndexMap<ClassId, ClassILP>, config: &Config) {
+fn remove_empty_classes<C: Copy>(vars: &mut IndexMap<ClassId, ClassILP<C>>, config: &Config) {
     if config.remove_empty_classes {
         let mut empty_classes: std::collections::VecDeque<ClassId> = Default::default();
         for (classid, detail) in vars.iter() {
@@ -733,8 +1047,8 @@ fn remove_empty_classes(vars: &mut IndexMap<ClassId, ClassILP>, config: &Config)
 }
 
 // Any class that is a child of each node in a root, is also a root.
-fn find_extra_roots(
-    vars: &mut IndexMap<ClassId, ClassILP>,
+fn find_extra_roots<C: Copy>(
+    vars: &mut IndexMap<ClassId, ClassILP<C>>,
     roots: &mut Vec<ClassId>,
     config: &Config,
 ) {
@@ -777,7 +1091,11 @@ For each class with one parent, move the minimum costs of the members to each no
 
 if we iterated through these in order, from child to parent, to parent, to parent.. it could be done in one pass.
 */
-fn pull_up_costs(vars: &mut IndexMap<ClassId, ClassILP>, roots: &[ClassId], config: &Config) {
+fn pull_up_costs<C: Copy>(
+    vars: &mut IndexMap<ClassId, ClassILP<C>>,
+    roots: &[ClassId],
+    config: &Config,
+) {
     if config.pull_up_costs {
         let mut count = 0;
         let mut changed = true;
@@ -844,8 +1162,8 @@ There could be a long chain of single parent classes - which this handles
 
 */
 
-fn pull_up_with_single_parent(
-    vars: &mut IndexMap<ClassId, ClassILP>,
+fn pull_up_with_single_parent<C: Copy>(
+    vars: &mut IndexMap<ClassId, ClassILP<C>>,
     roots: &[ClassId],
     config: &Config,
 ) {
@@ -929,8 +1247,8 @@ fn pull_up_with_single_parent(
 // solution already that is 15, then any non-root node that costs more than 3 can't be selected
 // in the optimal solution.
 
-fn remove_high_cost(
-    vars: &mut IndexMap<ClassId, ClassILP>,
+fn remove_high_cost<C: Copy>(
+    vars: &mut IndexMap<ClassId, ClassILP<C>>,
     initial_result_cost: NotNan<f64>,
     roots: &[ClassId],
     config: &Config,
@@ -972,7 +1290,11 @@ fn remove_high_cost(
 
 // Remove nodes with any (a) child pointing back to its own class,
 // or (b) any child pointing to the sole root class.
-fn remove_with_loops(vars: &mut IndexMap<ClassId, ClassILP>, roots: &[ClassId], config: &Config) {
+fn remove_with_loops<C: Copy>(
+    vars: &mut IndexMap<ClassId, ClassILP<C>>,
+    roots: &[ClassId],
+    config: &Config,
+) {
     if config.remove_self_loops {
         let mut removed = 0;
         for (class_id, class_details) in vars.iter_mut() {
@@ -992,7 +1314,9 @@ fn remove_with_loops(vars: &mut IndexMap<ClassId, ClassILP>, roots: &[ClassId], 
 }
 
 // Mapping from child class to parent classes
-fn classes_with_single_parent(vars: &IndexMap<ClassId, ClassILP>) -> IndexMap<ClassId, ClassId> {
+fn classes_with_single_parent<C: Copy>(
+    vars: &IndexMap<ClassId, ClassILP<C>>,
+) -> IndexMap<ClassId, ClassId> {
     let mut child_to_parents: IndexMap<ClassId, IndexSet<ClassId>> = IndexMap::new();
 
     for (class_id, class_vars) in vars.iter() {
@@ -1020,8 +1344,8 @@ fn classes_with_single_parent(vars: &IndexMap<ClassId, ClassILP>) -> IndexMap<Cl
 }
 
 //Set of classes that can be reached from the [classes]
-fn reachable(
-    vars: &IndexMap<ClassId, ClassILP>,
+fn reachable<C: Copy>(
+    vars: &IndexMap<ClassId, ClassILP<C>>,
     classes: &[ClassId],
     is_reachable: &mut IndexSet<ClassId>,
 ) {
@@ -1038,7 +1362,11 @@ fn reachable(
 }
 
 // Adds constraints to stop the cycle.
-fn block_cycle(model: &mut Model, cycle: &Vec<ClassId>, vars: &IndexMap<ClassId, ClassILP>) {
+fn block_cycle<M: MilpModel>(
+    model: &mut M,
+    cycle: &Vec<ClassId>,
+    vars: &IndexMap<ClassId, ClassILP<M::Col>>,
+) {
     if cycle.is_empty() {
         return;
     }
@@ -1098,9 +1426,9 @@ So we limit how many can be found.
 */
 const CYCLE_LIMIT: usize = 1000;
 
-fn find_cycles_in_result(
+fn find_cycles_in_result<C: Copy>(
     extraction_result: &ExtractionResult,
-    vars: &IndexMap<ClassId, ClassILP>,
+    vars: &IndexMap<ClassId, ClassILP<C>>,
     roots: &[ClassId],
 ) -> Vec<Vec<ClassId>> {
     let mut status = IndexMap::<ClassId, TraverseStatus>::default();
@@ -1119,9 +1447,9 @@ fn find_cycles_in_result(
     cycles
 }
 
-fn cycle_dfs(
+fn cycle_dfs<C: Copy>(
     extraction_result: &ExtractionResult,
-    vars: &IndexMap<ClassId, ClassILP>,
+    vars: &IndexMap<ClassId, ClassILP<C>>,
     class_id: &ClassId,
     status: &mut IndexMap<ClassId, TraverseStatus>,
     cycles: &mut Vec<Vec<ClassId>>,
@@ -1159,6 +1487,7 @@ mod test {
     use super::Config;
     use crate::test::{generate_random_egraph, ELABORATE_TESTING};
 
+    use crate::milp::DefaultMilp;
     use crate::{faster_ilp_cbc::extract, EPSILON_ALLOWANCE};
     use rand::Rng;
     pub type Cost = ordered_float::NotNan<f64>;
@@ -1216,7 +1545,14 @@ mod test {
 
             let mut results: Option<Cost> = None;
             for c in config {
-                let extraction = extract(&egraph, &egraph.root_eclasses, c, u32::MAX);
+                let (extraction, _report) = extract::<DefaultMilp>(
+                    &egraph,
+                    &egraph.root_eclasses,
+                    c,
+                    u32::MAX,
+                    1,
+                    &super::WarmConfig::default(),
+                );
                 extraction.check(&egraph);
                 let dag_cost = extraction.dag_cost(&egraph, &egraph.root_eclasses);
                 if results.is_some() {

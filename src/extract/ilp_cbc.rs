@@ -3,42 +3,164 @@
 This extractor is simple so that it's easy to see that it's correct.
 
 If the timeout is reached, it will return the result of the faster-greedy-dag extractor.
+
+The solver is abstracted behind `crate::milp::MilpModel`, so the same model can
+be built for CBC / Gurobi / HiGHS. The free functions here are generic over the
+backend `M`; the public extractor structs default to `milp::DefaultMilp` (the
+one backend feature that is enabled), and `*_with::<M>()` methods let a caller
+pin a backend explicitly. The historical `*CbcExtractor` names are kept as type
+aliases so downstream crates don't have to change.
 */
 
+use super::faster_ilp_cbc::WarmConfig;
+use super::warm::{self, SolveReport, WarmStartMode};
 use super::*;
-use coin_cbc::{Col, Model, Sense};
+use crate::milp::{DefaultMilp, MilpModel, MilpSense, MilpSolution};
 use indexmap::IndexSet;
+use std::time::Instant;
 
-struct ClassVars {
-    active: Col,
-    nodes: Vec<Col>,
+/// Selection variables for one e-class: one "class is active" column plus one
+/// column per member node. Generic over the backend's column handle.
+struct ClassVars<C> {
+    active: C,
+    nodes: Vec<C>,
 }
 
-pub struct CbcExtractorWithTimeout<const TIMEOUT_IN_SECONDS: u32>;
+/// The auxiliary columns `block_cycles` creates, returned so a warm start can
+/// give them values too.
+///
+/// A MIP start that fixes only the binaries leaves these unset, and CBC in
+/// particular reads an unset column as `0.0` — which violates
+/// `level_child >= level_parent + 1` for every selected edge. That is one of
+/// the two concrete ways the previously-disabled warm-start code fed the solver
+/// an infeasible point. Seeding them explicitly removes the guesswork for every
+/// backend, not just CBC.
+struct CycleVars<C> {
+    /// One continuous "topological level" column per class.
+    levels: IndexMap<ClassId, C>,
+    /// `opposite[x_n] == 1 - x_n`, the big-M switch that disables a level
+    /// constraint when its node is not selected.
+    opposite: IndexMap<C, C>,
+}
 
-impl<const TIMEOUT_IN_SECONDS: u32> Extractor for CbcExtractorWithTimeout<TIMEOUT_IN_SECONDS> {
+/// DAG-optimal ILP extractor with a compile-time timeout. Backend-generic; use
+/// [`CbcExtractorWithTimeout`] for the previous (CBC) spelling.
+pub struct IlpExtractorWithTimeout<const TIMEOUT_IN_SECONDS: u32>;
+
+/// Legacy name for [`IlpExtractorWithTimeout`].
+///
+/// NOTE: a type alias to a *unit* struct cannot be used in expression position
+/// (`CbcExtractorWithTimeout::<10>` as a value is rejected by rustc), so
+/// construct it with `::new()` or use the neutral name directly.
+pub type CbcExtractorWithTimeout<const TIMEOUT_IN_SECONDS: u32> =
+    IlpExtractorWithTimeout<TIMEOUT_IN_SECONDS>;
+
+impl<const TIMEOUT_IN_SECONDS: u32> Extractor for IlpExtractorWithTimeout<TIMEOUT_IN_SECONDS> {
     fn extract(&self, egraph: &EGraph, roots: &[ClassId]) -> ExtractionResult {
-        return extract(egraph, roots, TIMEOUT_IN_SECONDS);
+        return extract::<DefaultMilp>(
+            egraph,
+            roots,
+            TIMEOUT_IN_SECONDS,
+            1,
+            &WarmConfig::default(),
+        )
+        .0;
     }
 }
 
-pub struct CbcExtractor {
+impl<const TIMEOUT_IN_SECONDS: u32> IlpExtractorWithTimeout<TIMEOUT_IN_SECONDS> {
+    /// Constructor, so the type aliases can also be used in expression
+    /// position (`CbcExtractorWithTimeout::<10>::new()`).
+    pub const fn new() -> Self {
+        Self
+    }
+
+    /// Same as [`Extractor::extract`], but with the MILP backend pinned.
+    pub fn extract_with<M: MilpModel>(
+        &self,
+        egraph: &EGraph,
+        roots: &[ClassId],
+    ) -> ExtractionResult {
+        extract::<M>(egraph, roots, TIMEOUT_IN_SECONDS, 1, &WarmConfig::default()).0
+    }
+}
+
+/// DAG-optimal ILP extractor with a runtime timeout. Backend-generic; use
+/// [`CbcExtractor`] for the previous (CBC) spelling.
+pub struct IlpExtractor {
     /// Solver time limit in seconds (`u32::MAX` for unbounded).
     pub timeout_seconds: u32,
+    /// Solver threads for each solve. `1` unless the caller opted in; see
+    /// [`MilpModel::set_threads`] for the slot-allocation invariant.
+    pub threads: u32,
+    /// Warm start + solver-log configuration; default = no MIP start, no log.
+    pub warm: WarmConfig,
 }
 
-impl Extractor for CbcExtractor {
-    fn extract(&self, egraph: &EGraph, roots: &[ClassId]) -> ExtractionResult {
-        return extract(egraph, roots, self.timeout_seconds);
+impl Default for IlpExtractor {
+    fn default() -> Self {
+        IlpExtractor {
+            timeout_seconds: u32::MAX,
+            threads: 1,
+            warm: WarmConfig::default(),
+        }
     }
 }
 
-fn extract(egraph: &EGraph, roots: &[ClassId], timeout_seconds: u32) -> ExtractionResult {
-    let mut model = Model::default();
+/// Legacy name for [`IlpExtractor`].
+pub type CbcExtractor = IlpExtractor;
 
-    model.set_parameter("seconds", &timeout_seconds.to_string());
+impl Extractor for IlpExtractor {
+    fn extract(&self, egraph: &EGraph, roots: &[ClassId]) -> ExtractionResult {
+        return extract::<DefaultMilp>(
+            egraph,
+            roots,
+            self.timeout_seconds,
+            self.threads,
+            &self.warm,
+        )
+        .0;
+    }
+}
 
-    let vars: IndexMap<ClassId, ClassVars> = egraph
+impl IlpExtractor {
+    /// Same as [`Extractor::extract`], but with the MILP backend pinned.
+    pub fn extract_with<M: MilpModel>(
+        &self,
+        egraph: &EGraph,
+        roots: &[ClassId],
+    ) -> ExtractionResult {
+        self.extract_with_report::<M>(egraph, roots).0
+    }
+
+    /// Same as [`Self::extract_with`], plus the [`SolveReport`].
+    pub fn extract_with_report<M: MilpModel>(
+        &self,
+        egraph: &EGraph,
+        roots: &[ClassId],
+    ) -> (ExtractionResult, SolveReport) {
+        extract::<M>(egraph, roots, self.timeout_seconds, self.threads, &self.warm)
+    }
+}
+
+fn extract<M: MilpModel>(
+    egraph: &EGraph,
+    roots: &[ClassId],
+    timeout_seconds: u32,
+    threads: u32,
+    warm: &WarmConfig,
+) -> (ExtractionResult, SolveReport) {
+    let mut report = SolveReport::new(M::NAME, "dag-ilp", threads, timeout_seconds, warm.mode);
+    let mut model = M::new();
+
+    model.set_time_limit_seconds(timeout_seconds);
+    model.set_threads(threads);
+    if let Some(path) = &warm.milp_log {
+        model.set_log_file(path);
+        report.milp_log = Some(path.clone());
+    }
+
+    let vars: IndexMap<ClassId, ClassVars<M::Col>> = egraph
         .classes()
         .values()
         .map(|class| {
@@ -82,7 +204,7 @@ fn extract(egraph: &EGraph, roots: &[ClassId], timeout_seconds: u32) -> Extracti
         }
     }
 
-    model.set_obj_sense(Sense::Minimize);
+    model.set_obj_sense(MilpSense::Minimize);
     for class in egraph.classes().values() {
         for (node_id, &node_active) in class.nodes.iter().zip(&vars[&class.id].nodes) {
             let node = &egraph[node_id];
@@ -99,23 +221,53 @@ fn extract(egraph: &EGraph, roots: &[ClassId], timeout_seconds: u32) -> Extracti
         model.set_col_lower(vars[root].active, 1.0);
     }
 
-    block_cycles(&mut model, &vars, &egraph);
+    let cyc = block_cycles(&mut model, &vars, &egraph);
 
-    let solution = model.solve();
-    log::info!(
-        "CBC status {:?}, {:?}, obj = {}",
-        solution.raw().status(),
-        solution.raw().secondary_status(),
-        solution.raw().obj_value(),
+    apply_warm_start(
+        &mut model, egraph, roots, &vars, &cyc, None, warm, &mut report,
     );
 
-    if solution.raw().status() != coin_cbc::raw::Status::Finished {
-        assert!(timeout_seconds != std::u32::MAX);
+    let solve_clock = Instant::now();
+    let solution = model.solve();
+    report.num_solves = 1;
+    report.solve_wall_secs = solve_clock.elapsed().as_secs_f64();
+    report.record_solution(&solution);
+    report.load_trajectory();
+    log::info!(
+        "{} status {}, obj = {}",
+        M::NAME,
+        solution.status_detail(),
+        solution.obj_value(),
+    );
 
-        let initial_result =
-            super::faster_greedy_dag::FasterGreedyDagExtractor.extract(egraph, roots);
-        log::info!("Unfinished CBC solution");
-        return initial_result;
+    if !solution.has_solution() {
+        // No greedy stand-in: the CALLER holds the input mapping and its own
+        // seed and floors against them. An empty
+        // result says "the solver produced nothing", which is the only fact
+        // this crate knows.
+        log::info!(
+            "{} returned no solution ({}); returning an empty selection for the \
+             caller to floor against its own candidates",
+            M::NAME,
+            solution.status_detail()
+        );
+        report.returned_fallback = true;
+        return (ExtractionResult::default(), report);
+    }
+
+    if !solution.ran_to_completion() {
+        debug_assert!(timeout_seconds != std::u32::MAX);
+        // Keep the incumbent. `has_solution` is checked above, so reaching here
+        // means one EXISTS -- the old unconditional fallback threw away a valid,
+        // strictly better answer on every timeout. Returning it is sound:
+        // `block_cycles` encodes a topological order, so any feasible solution
+        // is acyclic by construction, and this model has no budget to violate.
+        // Same fix as the delay-budget extractor below.
+        log::info!(
+            "Unfinished {} solution, but an incumbent exists (obj = {}); returning it",
+            M::NAME,
+            solution.obj_value(),
+        );
     }
 
     let mut result = ExtractionResult::default();
@@ -133,7 +285,7 @@ fn extract(egraph: &EGraph, roots: &[ClassId], timeout_seconds: u32) -> Extracti
         }
     }
 
-    return result;
+    return (result, report);
 }
 
 /*
@@ -149,8 +301,12 @@ fn extract(egraph: &EGraph, roots: &[ClassId], timeout_seconds: u32) -> Extracti
  has class A as a child, 'm' must be less than 'l', which is a contradiction.
 */
 
-fn block_cycles(model: &mut Model, vars: &IndexMap<ClassId, ClassVars>, egraph: &EGraph) {
-    let mut levels: IndexMap<ClassId, Col> = Default::default();
+fn block_cycles<M: MilpModel>(
+    model: &mut M,
+    vars: &IndexMap<ClassId, ClassVars<M::Col>>,
+    egraph: &EGraph,
+) -> CycleVars<M::Col> {
+    let mut levels: IndexMap<ClassId, M::Col> = Default::default();
     for c in vars.keys() {
         let var = model.add_col();
         levels.insert(c.clone(), var);
@@ -160,7 +316,7 @@ fn block_cycles(model: &mut Model, vars: &IndexMap<ClassId, ClassVars>, egraph: 
     }
 
     // If n.variable is true, opposite_col will be false and vice versa.
-    let mut opposite: IndexMap<Col, Col> = Default::default();
+    let mut opposite: IndexMap<M::Col, M::Col> = Default::default();
     for c in vars.values() {
         for n in &c.nodes {
             let opposite_col = model.add_binary();
@@ -208,6 +364,167 @@ fn block_cycles(model: &mut Model, vars: &IndexMap<ClassId, ClassVars>, egraph: 
             }
         }
     }
+
+    CycleVars { levels, opposite }
+}
+
+/// The arrival-time part of a warm start, for the two delay-aware models.
+struct ArrivalSeed<'a, C> {
+    /// `T_c` column per class.
+    arr: &'a IndexMap<ClassId, C>,
+    /// Upper bound that was applied to every `T_c` (`S` for dual, the budget
+    /// for delay-budget). Seeded values are clamped into `[0, cap]` so a
+    /// last-ulp overshoot cannot put the start outside its own column bounds.
+    cap: f64,
+    /// The dual model's extra `t >= T_root` objective column.
+    t: Option<C>,
+    /// Hard delay budget the seed must satisfy, if the model has one. This is
+    /// the check the task calls for: evaluate the candidate in the ILP's own
+    /// arrival recurrence and compare against the budget the ILP enforces.
+    budget: Option<f64>,
+}
+
+/// Warm-start entry point shared by the three `ilp_cbc` models.
+///
+/// Everything here is refusable: any problem with the candidate ends in
+/// [`SolveReport::refuse_warm_start`] and a solve with no MIP start, never a
+/// panic and never an infeasible point pushed to the solver.
+#[allow(clippy::too_many_arguments)]
+fn apply_warm_start<M: MilpModel>(
+    model: &mut M,
+    egraph: &EGraph,
+    roots: &[ClassId],
+    vars: &IndexMap<ClassId, ClassVars<M::Col>>,
+    cyc: &CycleVars<M::Col>,
+    arrival: Option<ArrivalSeed<M::Col>>,
+    warm: &WarmConfig,
+    report: &mut SolveReport,
+) {
+    if warm.mode == WarmStartMode::None {
+        return;
+    }
+    if !model.supports_warm_start() {
+        report.refuse_warm_start(format!(
+            "{} does not support a trustworthy MIP start (see CbcModel::supports_warm_start)",
+            M::NAME
+        ));
+        return;
+    }
+
+    // A seed is only ever the caller's. This crate no longer computes one:
+    // exgym's own area-greedy was both the seed AND the acceptance bar, and it
+    // carries no bound relative to the input mapping the caller is holding,
+    // so a run could ship something bigger than its own input. The caller
+    // picks the best of its own candidates — including the input mapping —
+    // and passes the winner here.
+    let (preferred, effective, mut note) = match warm.mode {
+        WarmStartMode::Greedy => {
+            return report.refuse_warm_start(
+                "greedy seeding was removed: this crate no longer computes a seed of its \
+                 own (it was unbounded in how much worse than the input mapping it could \
+                 be). Pass a caller-supplied seed with WarmStartMode::Initial.",
+            )
+        }
+        WarmStartMode::Initial => match &warm.seed {
+            Some(s) => (Some(s), WarmStartMode::Initial, None),
+            None => {
+                return report.refuse_warm_start(
+                    "no initial extraction was supplied and there is no greedy seed to \
+                     degrade to; running with no MIP start",
+                )
+            }
+        },
+        WarmStartMode::None => unreachable!(),
+    };
+
+    // Repair fallback for a class the preferred seed cannot fill: `build_seed`
+    // drops through to the cheapest member of that class (a LOCAL choice inside
+    // the class the walk already committed to), not to a whole greedy extraction.
+    let repair = ExtractionResult::default();
+    let seed = match warm::build_seed(egraph, roots, preferred, &repair) {
+        Ok(s) => s,
+        Err(why) => return report.refuse_warm_start(why),
+    };
+    if seed.repaired > 0 {
+        let extra = format!("{} class(es) repaired off the preferred node", seed.repaired);
+        note = Some(match note {
+            Some(n) => format!("{n}; {extra}"),
+            None => extra,
+        });
+    }
+
+    // Arrival times, in the ILP's own recurrence.
+    let arrival_times = match &arrival {
+        Some(_) => match warm::arrival_times(egraph, roots, &seed.selection) {
+            Ok(t) => Some(t),
+            Err(why) => return report.refuse_warm_start(why),
+        },
+        None => None,
+    };
+
+    // THE feasibility gate for the delay-budget model. Note it is checked
+    // against EVERY class, not just the roots: `extract_delay_budget` caps every
+    // arrival column at the budget, so a single interior class over budget makes
+    // the whole point infeasible.
+    if let (Some(a), Some(times)) = (&arrival, &arrival_times) {
+        if let Some(budget) = a.budget {
+            let worst = times.values().cloned().fold(0.0f64, f64::max);
+            if worst > budget {
+                return report.refuse_warm_start(format!(
+                    "candidate seed violates the delay budget in the ILP's own arrival \
+                     formulation: worst class arrival {worst:.9} > budget {budget:.9} \
+                     (over by {:.3e}). Greedy seeds minimise area and carry no delay \
+                     guarantee; a design-derived budget is also exactly tight, so any \
+                     positive margin is a violation.",
+                    worst - budget
+                ));
+            }
+            let extra = format!("delay slack {:.3e} under the budget", budget - worst);
+            note = Some(match note {
+                Some(n) => format!("{n}; {extra}"),
+                None => extra,
+            });
+        }
+    }
+
+    // -- push the point ------------------------------------------------------
+    // Selection binaries.
+    for (cid, cvars) in vars {
+        let chosen = seed.selection.choices.get(cid);
+        model.set_col_initial_solution(cvars.active, if chosen.is_some() { 1.0 } else { 0.0 });
+        for (nid, &col) in egraph[cid].nodes.iter().zip(&cvars.nodes) {
+            let on = chosen == Some(nid);
+            model.set_col_initial_solution(col, if on { 1.0 } else { 0.0 });
+            // opposite == 1 - x
+            if let Some(&opp) = cyc.opposite.get(&col) {
+                model.set_col_initial_solution(opp, if on { 0.0 } else { 1.0 });
+            }
+        }
+    }
+
+    // Topological levels for the cycle-blocking rows.
+    let levels = warm::topological_levels(egraph, roots, &seed.selection);
+    for (cid, &col) in &cyc.levels {
+        model.set_col_initial_solution(col, *levels.get(cid).unwrap_or(&0.0));
+    }
+
+    // Arrival times (and the dual model's `t`).
+    if let (Some(a), Some(times)) = (&arrival, &arrival_times) {
+        let mut t_val = 0.0f64;
+        for (cid, &col) in a.arr {
+            let v = times.get(cid).cloned().unwrap_or(0.0).clamp(0.0, a.cap);
+            model.set_col_initial_solution(col, v);
+        }
+        for root in roots {
+            t_val = t_val.max(times.get(root).cloned().unwrap_or(0.0));
+        }
+        if let Some(t) = a.t {
+            model.set_col_initial_solution(t, t_val.clamp(0.0, a.cap));
+        }
+    }
+
+    report.warm_start_objective = warm::try_dag_cost(egraph, roots, &seed.selection);
+    report.accept_warm_start(effective, note);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -238,18 +555,77 @@ fn node_delay(node: &Node) -> f64 {
     node.delay.into_inner()
 }
 
-pub struct DualCbcExtractor {
+/// Joint delay+area ILP extractor. Backend-generic; use [`DualCbcExtractor`]
+/// for the previous (CBC) spelling.
+pub struct DualIlpExtractor {
     /// Solver time limit in seconds (u32::MAX for unbounded).
     pub timeout_seconds: u32,
     /// Weight on the critical-path delay.
     pub alpha: f64,
     /// Weight on the total area.
     pub beta: f64,
+    /// Solver threads for each solve. `1` unless the caller opted in; see
+    /// [`MilpModel::set_threads`] for the slot-allocation invariant.
+    pub threads: u32,
+    /// Warm start + solver-log configuration; default = no MIP start, no log.
+    pub warm: WarmConfig,
 }
 
-impl Extractor for DualCbcExtractor {
+impl Default for DualIlpExtractor {
+    fn default() -> Self {
+        DualIlpExtractor {
+            timeout_seconds: u32::MAX,
+            alpha: 1.0,
+            beta: 1.0,
+            threads: 1,
+            warm: WarmConfig::default(),
+        }
+    }
+}
+
+/// Legacy name for [`DualIlpExtractor`].
+pub type DualCbcExtractor = DualIlpExtractor;
+
+impl Extractor for DualIlpExtractor {
     fn extract(&self, egraph: &EGraph, roots: &[ClassId]) -> ExtractionResult {
-        extract_dual(egraph, roots, self.timeout_seconds, self.alpha, self.beta)
+        extract_dual::<DefaultMilp>(
+            egraph,
+            roots,
+            self.timeout_seconds,
+            self.alpha,
+            self.beta,
+            self.threads,
+            &self.warm,
+        )
+        .0
+    }
+}
+
+impl DualIlpExtractor {
+    /// Same as [`Extractor::extract`], but with the MILP backend pinned.
+    pub fn extract_with<M: MilpModel>(
+        &self,
+        egraph: &EGraph,
+        roots: &[ClassId],
+    ) -> ExtractionResult {
+        self.extract_with_report::<M>(egraph, roots).0
+    }
+
+    /// Same as [`Self::extract_with`], plus the [`SolveReport`].
+    pub fn extract_with_report<M: MilpModel>(
+        &self,
+        egraph: &EGraph,
+        roots: &[ClassId],
+    ) -> (ExtractionResult, SolveReport) {
+        extract_dual::<M>(
+            egraph,
+            roots,
+            self.timeout_seconds,
+            self.alpha,
+            self.beta,
+            self.threads,
+            &self.warm,
+        )
     }
 }
 
@@ -269,12 +645,16 @@ impl Extractor for DualCbcExtractor {
 /// sound bound — see the arrival-row derivation). Shared by every extractor in
 /// this module that needs critical-path delay. Returns the class selection
 /// vars, the arrival-time column per class, and `S`.
-fn build_selection_and_arrival(
-    model: &mut Model,
+fn build_selection_and_arrival<M: MilpModel>(
+    model: &mut M,
     egraph: &EGraph,
     big_m_fn: impl Fn(f64, f64) -> f64,
-) -> (IndexMap<ClassId, ClassVars>, IndexMap<ClassId, Col>, f64) {
-    let vars: IndexMap<ClassId, ClassVars> = egraph
+) -> (
+    IndexMap<ClassId, ClassVars<M::Col>>,
+    IndexMap<ClassId, M::Col>,
+    f64,
+) {
+    let vars: IndexMap<ClassId, ClassVars<M::Col>> = egraph
         .classes()
         .values()
         .map(|class| {
@@ -336,7 +716,7 @@ fn build_selection_and_arrival(
         if m > 0.0 { m } else { 1.0 }
     };
 
-    let arr: IndexMap<ClassId, Col> = vars
+    let arr: IndexMap<ClassId, M::Col> = vars
         .keys()
         .map(|c| {
             let v = model.add_col();
@@ -378,21 +758,30 @@ fn build_selection_and_arrival(
     (vars, arr, s)
 }
 
-fn extract_dual(
+#[allow(clippy::too_many_arguments)]
+fn extract_dual<M: MilpModel>(
     egraph: &EGraph,
     roots: &[ClassId],
     timeout_seconds: u32,
     alpha: f64,
     beta: f64,
-) -> ExtractionResult {
-    let mut model = Model::default();
-    model.set_parameter("seconds", &timeout_seconds.to_string());
+    threads: u32,
+    warm: &WarmConfig,
+) -> (ExtractionResult, SolveReport) {
+    let mut report = SolveReport::new(M::NAME, "dual-ilp", threads, timeout_seconds, warm.mode);
+    let mut model = M::new();
+    model.set_time_limit_seconds(timeout_seconds);
+    model.set_threads(threads);
+    if let Some(path) = &warm.milp_log {
+        model.set_log_file(path);
+        report.milp_log = Some(path.clone());
+    }
 
     // Dual keeps arrival cols on their [0, S] bound, so the sound big-M is 2S.
     let (vars, arr, s) = build_selection_and_arrival(&mut model, egraph, |s, _d_max| 2.0 * s);
 
     // Objective: alpha * t + beta * sum(area * x), where t >= max root arrival.
-    model.set_obj_sense(Sense::Minimize);
+    model.set_obj_sense(MilpSense::Minimize);
 
     let t = model.add_col();
     model.set_col_lower(t, 0.0);
@@ -423,21 +812,66 @@ fn extract_dual(
         model.set_col_lower(vars[root].active, 1.0);
     }
 
-    block_cycles(&mut model, &vars, &egraph);
+    let cyc = block_cycles(&mut model, &vars, &egraph);
 
-    let solution = model.solve();
-    log::info!(
-        "Dual CBC status {:?}, {:?}, obj = {}",
-        solution.raw().status(),
-        solution.raw().secondary_status(),
-        solution.raw().obj_value(),
+    // No budget: every complete acyclic selection satisfies the dual model, so
+    // the arrival seed is informational (it just saves the solver the LP) and
+    // can never be rejected on feasibility grounds.
+    apply_warm_start(
+        &mut model,
+        egraph,
+        roots,
+        &vars,
+        &cyc,
+        Some(ArrivalSeed {
+            arr: &arr,
+            cap: s.max(0.0),
+            t: Some(t),
+            budget: None,
+        }),
+        warm,
+        &mut report,
     );
 
-    if solution.raw().status() != coin_cbc::raw::Status::Finished {
-        assert!(timeout_seconds != std::u32::MAX);
-        // NOTE: the fallback optimises area only (not the dual objective).
-        log::info!("Unfinished dual CBC solution; falling back to area-greedy DAG");
-        return super::faster_greedy_dag::FasterGreedyDagExtractor.extract(egraph, roots);
+    let solve_clock = Instant::now();
+    let solution = model.solve();
+    report.num_solves = 1;
+    report.solve_wall_secs = solve_clock.elapsed().as_secs_f64();
+    report.record_solution(&solution);
+    report.load_trajectory();
+    log::info!(
+        "Dual {} status {}, obj = {}",
+        M::NAME,
+        solution.status_detail(),
+        solution.obj_value(),
+    );
+
+    if !solution.has_solution() {
+        // No greedy stand-in: the CALLER holds the input mapping and its own
+        // seed and floors against them. An empty
+        // result says "the solver produced nothing", which is the only fact
+        // this crate knows.
+        log::info!(
+            "{} returned no solution ({}); returning an empty selection for the \
+             caller to floor against its own candidates",
+            M::NAME,
+            solution.status_detail()
+        );
+        report.returned_fallback = true;
+        return (ExtractionResult::default(), report);
+    }
+
+    if !solution.ran_to_completion() {
+        debug_assert!(timeout_seconds != std::u32::MAX);
+        // Keep the incumbent -- see the identical fix in the area extractor.
+        // The area-greedy fallback optimises AREA ONLY, not `alpha*delay +
+        // beta*area`, so discarding a dual incumbent here traded a better joint
+        // solution for one that ignores the objective the caller asked for.
+        log::info!(
+            "Unfinished dual {} solution, but an incumbent exists (obj = {}); returning it",
+            M::NAME,
+            solution.obj_value(),
+        );
     }
 
     let mut result = ExtractionResult::default();
@@ -454,7 +888,7 @@ fn extract_dual(
         }
     }
 
-    result
+    (result, report)
 }
 
 /* ------------------------------------------------------------------------- */
@@ -471,27 +905,97 @@ fn extract_dual(
 /* as a provable ILP infeasibility rather than a silently wrong answer.     */
 /* ------------------------------------------------------------------------- */
 
-pub struct DelayBudgetCbcExtractor {
+/// Minimum-area-under-a-delay-budget ILP extractor. Backend-generic; use
+/// [`DelayBudgetCbcExtractor`] for the previous (CBC) spelling.
+pub struct DelayBudgetIlpExtractor {
     /// Solver time limit in seconds (u32::MAX for unbounded).
     pub timeout_seconds: u32,
     /// Hard upper bound on the critical-path delay of the extraction.
     pub max_delay: f64,
+    /// Solver threads for each solve. `1` unless the caller opted in; see
+    /// [`MilpModel::set_threads`] for the slot-allocation invariant.
+    pub threads: u32,
+    /// Warm start + solver-log configuration; default = no MIP start, no log.
+    pub warm: WarmConfig,
 }
 
-impl Extractor for DelayBudgetCbcExtractor {
-    fn extract(&self, egraph: &EGraph, roots: &[ClassId]) -> ExtractionResult {
-        extract_delay_budget(egraph, roots, self.timeout_seconds, self.max_delay)
+impl Default for DelayBudgetIlpExtractor {
+    fn default() -> Self {
+        DelayBudgetIlpExtractor {
+            timeout_seconds: u32::MAX,
+            max_delay: f64::INFINITY,
+            threads: 1,
+            warm: WarmConfig::default(),
+        }
     }
 }
 
-fn extract_delay_budget(
+/// Legacy name for [`DelayBudgetIlpExtractor`].
+pub type DelayBudgetCbcExtractor = DelayBudgetIlpExtractor;
+
+impl Extractor for DelayBudgetIlpExtractor {
+    fn extract(&self, egraph: &EGraph, roots: &[ClassId]) -> ExtractionResult {
+        extract_delay_budget::<DefaultMilp>(
+            egraph,
+            roots,
+            self.timeout_seconds,
+            self.max_delay,
+            self.threads,
+            &self.warm,
+        )
+        .0
+    }
+}
+
+impl DelayBudgetIlpExtractor {
+    /// Same as [`Extractor::extract`], but with the MILP backend pinned.
+    pub fn extract_with<M: MilpModel>(
+        &self,
+        egraph: &EGraph,
+        roots: &[ClassId],
+    ) -> ExtractionResult {
+        self.extract_with_report::<M>(egraph, roots).0
+    }
+
+    /// Same as [`Self::extract_with`], plus the [`SolveReport`].
+    pub fn extract_with_report<M: MilpModel>(
+        &self,
+        egraph: &EGraph,
+        roots: &[ClassId],
+    ) -> (ExtractionResult, SolveReport) {
+        extract_delay_budget::<M>(
+            egraph,
+            roots,
+            self.timeout_seconds,
+            self.max_delay,
+            self.threads,
+            &self.warm,
+        )
+    }
+}
+
+fn extract_delay_budget<M: MilpModel>(
     egraph: &EGraph,
     roots: &[ClassId],
     timeout_seconds: u32,
     max_delay: f64,
-) -> ExtractionResult {
-    let mut model = Model::default();
-    model.set_parameter("seconds", &timeout_seconds.to_string());
+    threads: u32,
+    warm: &WarmConfig,
+) -> (ExtractionResult, SolveReport) {
+    let mut report = SolveReport::new(
+        M::NAME,
+        "delay-budget-ilp",
+        threads,
+        timeout_seconds,
+        warm.mode,
+    );
+    let mut model = M::new();
+    model.set_time_limit_seconds(timeout_seconds);
+    model.set_threads(threads);
+    if let Some(path) = &warm.milp_log {
+        model.set_log_file(path);
+        report.milp_log = Some(path.clone());
+    }
 
     // Tight, well-conditioned big-M: since we cap every arrival col at `budget`
     // (below), the sound bound for the arrival relaxation is exactly
@@ -499,8 +1003,8 @@ fn extract_delay_budget(
     // cell, NOT a path delay). With real per-gate delays on every node (the
     // boolean-op primitives now carry their AN2/OR2/XOR2/INV delays instead of a
     // 1e4/1e9 sentinel), D_max is physical (~100 ps), so this M is ~1x the RHS
-    // scale and CBC's tolerances stay well-conditioned — unlike the loose 2S,
-    // whose S was inflated by the old sentinels into a ~1e7 coefficient.
+    // scale and the solver's tolerances stay well-conditioned — unlike the loose
+    // 2S, whose S was inflated by the old sentinels into a ~1e7 coefficient.
     let (vars, arr, s) = build_selection_and_arrival(&mut model, egraph, |s, d_max| {
         let budget = max_delay.min(s.max(0.0)).max(0.0);
         budget + d_max
@@ -525,7 +1029,7 @@ fn extract_delay_budget(
     }
 
     // Objective: minimise area alone.
-    model.set_obj_sense(Sense::Minimize);
+    model.set_obj_sense(MilpSense::Minimize);
     for class in egraph.classes().values() {
         for (node_id, &node_active) in class.nodes.iter().zip(&vars[&class.id].nodes) {
             let area = node_area(&egraph[node_id]);
@@ -539,27 +1043,79 @@ fn extract_delay_budget(
         model.set_col_lower(vars[root].active, 1.0);
     }
 
-    block_cycles(&mut model, &vars, &egraph);
+    let cyc = block_cycles(&mut model, &vars, &egraph);
 
-    let solution = model.solve();
-    log::info!(
-        "Delay-budget CBC status {:?}, {:?}, obj = {}",
-        solution.raw().status(),
-        solution.raw().secondary_status(),
-        solution.raw().obj_value(),
+    // The budget is the one hard side constraint in this crate's models, so it
+    // is where a warm start can genuinely be infeasible. `apply_warm_start`
+    // evaluates the candidate through `warm::arrival_times` — the same
+    // recurrence these rows encode — and refuses (with the margin in the log)
+    // rather than seeding an infeasible point.
+    apply_warm_start(
+        &mut model,
+        egraph,
+        roots,
+        &vars,
+        &cyc,
+        Some(ArrivalSeed {
+            arr: &arr,
+            cap: budget,
+            t: None,
+            budget: Some(budget),
+        }),
+        warm,
+        &mut report,
     );
 
-    if solution.raw().is_proven_infeasible() {
+    let solve_clock = Instant::now();
+    let solution = model.solve();
+    report.num_solves = 1;
+    report.solve_wall_secs = solve_clock.elapsed().as_secs_f64();
+    report.record_solution(&solution);
+    report.load_trajectory();
+    log::info!(
+        "Delay-budget {} status {}, obj = {}",
+        M::NAME,
+        solution.status_detail(),
+        solution.obj_value(),
+    );
+
+    if solution.is_infeasible() {
         log::info!("Infeasible, returning empty solution");
-        return ExtractionResult::default();
+        return (ExtractionResult::default(), report);
     }
 
-    if solution.raw().status() != coin_cbc::raw::Status::Finished {
-        assert!(timeout_seconds != std::u32::MAX);
-        // NOTE: the fallback optimises area only and ignores max_delay
-        // entirely, so it is not guaranteed to respect the delay budget.
-        log::info!("Unfinished delay-budget CBC solution; falling back to area-greedy DAG");
-        return super::faster_greedy_dag::FasterGreedyDagExtractor.extract(egraph, roots);
+    if !solution.ran_to_completion() {
+        debug_assert!(timeout_seconds != std::u32::MAX);
+        // Fall back ONLY when the solver has no incumbent to return.
+        //
+        // This previously fell back on ANY timeout, discarding a perfectly good
+        // answer. Unlike the area extractor's model, this one needs no
+        // solve/find-cycles/re-block loop: `block_cycles` (see the call above)
+        // encodes a topological ordering directly into the constraints, and the
+        // arrival-time rows bound every path by `max_delay`. So ANY feasible
+        // solution here is acyclic AND within budget by construction -- there is
+        // nothing left to validate before returning it. (Structural nodes carry
+        // delay EPS = 1e-6 rather than 0, so a zero-delay cycle cannot sneak
+        // past the arrival-time rows either.)
+        //
+        // The fallback, by contrast, optimises area only and ignores max_delay,
+        // so the old code could discard a budget-feasible incumbent in favour of
+        // a possibly budget-violating greedy result.
+        if !solution.has_solution() {
+            log::info!(
+                "Unfinished delay-budget {} solution with no incumbent; returning an \
+                 empty selection for the caller to floor against its own candidates",
+                M::NAME
+            );
+            report.returned_fallback = true;
+            return (ExtractionResult::default(), report);
+        }
+        log::info!(
+            "Unfinished delay-budget {} solution, but an incumbent exists (obj = {}); \
+             returning it -- acyclic and within budget by construction",
+            M::NAME,
+            solution.obj_value(),
+        );
     }
 
     let mut result = ExtractionResult::default();
@@ -576,5 +1132,5 @@ fn extract_delay_budget(
         }
     }
 
-    result
+    (result, report)
 }

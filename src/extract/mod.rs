@@ -7,13 +7,20 @@ pub use crate::*;
 pub mod bottom_up;
 pub mod faster_bottom_up;
 pub mod faster_greedy_dag;
-#[cfg(feature = "ilp-cbc")]
+#[cfg(feature = "ilp-any")]
 pub mod faster_ilp_cbc;
 pub mod global_greedy_dag;
 pub mod greedy_dag;
-#[cfg(feature = "ilp-cbc")]
+#[cfg(feature = "ilp-any")]
 pub mod ilp_cbc;
 pub mod prio_queue;
+/// Warm-start construction/validation + the per-run solver report shared by
+/// both ILP extractors.
+#[cfg(feature = "ilp-any")]
+pub mod warm;
+
+#[cfg(feature = "ilp-any")]
+pub use warm::{SolveReport, WarmStartMode};
 
 // Allowance for floating point values to be considered equal
 pub const EPSILON_ALLOWANCE: f64 = 0.00001;

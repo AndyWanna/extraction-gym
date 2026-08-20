@@ -108,7 +108,7 @@ pub fn generate_random_egraph() -> EGraph {
  * Checks that the extractions are valid.
  */
 
-#[cfg(feature = "ilp-cbc")]
+#[cfg(feature = "ilp-any")]
 fn check_dag_optimal(
     egraph: &EGraph,
     optimal_dag: &[Box<dyn Extractor>],
@@ -152,14 +152,14 @@ fn check_dag_optimal(
 }
 
 fn check_optimal_results<I: Iterator<Item = EGraph>>(egraphs: I) {
-    #[cfg(feature = "ilp-cbc")]
+    #[cfg(feature = "ilp-any")]
     let mut optimal_dag: Vec<Box<dyn Extractor>> = Default::default();
     let mut optimal_tree: Vec<Box<dyn Extractor>> = Default::default();
     let mut others: Vec<Box<dyn Extractor>> = Default::default();
 
     for (_, ed) in extractors().into_iter() {
         match ed.optimal {
-            #[cfg(feature = "ilp-cbc")]
+            #[cfg(feature = "ilp-any")]
             Optimal::Dag => optimal_dag.push(ed.extractor),
             Optimal::Tree => optimal_tree.push(ed.extractor),
             Optimal::Neither => others.push(ed.extractor),
@@ -195,7 +195,7 @@ fn check_optimal_results<I: Iterator<Item = EGraph>>(egraphs: I) {
             }
         }
 
-        #[cfg(feature = "ilp-cbc")]
+        #[cfg(feature = "ilp-any")]
         check_dag_optimal(&egraph, &optimal_dag, &others, optimal_tree_cost);
     }
 }
@@ -229,8 +229,8 @@ macro_rules! create_optimal_check_tests {
         $(
             #[test]
             fn $name() {
-                // Fewer iterations when ilp-cbc is enabled since it's slow
-                let iterations = if cfg!(feature = "ilp-cbc") { 100 } else { 10000 };
+                // Fewer iterations when an ILP backend is enabled since it's slow
+                let iterations = if cfg!(feature = "ilp-any") { 100 } else { 10000 };
                 let egraphs = (0..iterations).map(|_| generate_random_egraph());
                 check_optimal_results(egraphs);
             }

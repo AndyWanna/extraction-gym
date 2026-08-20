@@ -1,4 +1,6 @@
 pub mod extract;
+#[cfg(feature = "ilp-any")]
+pub mod milp;
 
 pub use extract::*;
 
@@ -13,7 +15,7 @@ pub const INFINITY: Cost = unsafe { NotNan::new_unchecked(f64::INFINITY) };
 #[derive(PartialEq, Eq)]
 pub enum Optimal {
     Tree,
-    #[cfg(feature = "ilp-cbc")]
+    #[cfg(feature = "ilp-any")]
     Dag,
     Neither,
 }
@@ -67,49 +69,53 @@ pub fn extractors() -> IndexMap<&'static str, ExtractorDetail> {
                 use_for_bench: true,
             },
         ),*/
-        #[cfg(feature = "ilp-cbc")]
+        #[cfg(feature = "ilp-any")]
         (
             "ilp-cbc-timeout",
             ExtractorDetail {
-                extractor: extract::ilp_cbc::CbcExtractorWithTimeout::<10>.boxed(),
+                extractor: extract::ilp_cbc::IlpExtractorWithTimeout::<10>.boxed(),
                 optimal: Optimal::Dag,
                 use_for_bench: true,
             },
         ),
-        #[cfg(feature = "ilp-cbc")]
+        #[cfg(feature = "ilp-any")]
         (
             "ilp-cbc",
             ExtractorDetail {
                 extractor: extract::ilp_cbc::CbcExtractor {
                     timeout_seconds: u32::MAX,
+                    threads: 1,
+                    ..Default::default()
                 }
                 .boxed(),
                 optimal: Optimal::Dag,
                 use_for_bench: false, // takes >10 hours sometimes
             },
         ),
-        #[cfg(feature = "ilp-cbc")]
+        #[cfg(feature = "ilp-any")]
         (
             "faster-ilp-cbc-timeout",
             ExtractorDetail {
-                extractor: extract::faster_ilp_cbc::FasterCbcExtractorWithTimeout::<10>.boxed(),
+                extractor: extract::faster_ilp_cbc::FasterIlpExtractorWithTimeout::<10>.boxed(),
                 optimal: Optimal::Dag,
                 use_for_bench: true,
             },
         ),
-        #[cfg(feature = "ilp-cbc")]
+        #[cfg(feature = "ilp-any")]
         (
             "faster-ilp-cbc",
             ExtractorDetail {
                 extractor: extract::faster_ilp_cbc::FasterCbcExtractor {
                     timeout_seconds: u32::MAX,
+                    threads: 1,
+                    ..Default::default()
                 }
                 .boxed(),
                 optimal: Optimal::Dag,
                 use_for_bench: true,
             },
         ),
-        #[cfg(feature = "ilp-cbc")]
+        #[cfg(feature = "ilp-any")]
         (
             "dual-ilp-cbc-timeout",
             ExtractorDetail {
@@ -119,13 +125,15 @@ pub fn extractors() -> IndexMap<&'static str, ExtractorDetail> {
                     timeout_seconds: 10,
                     alpha: 1.0,
                     beta: 1.0,
+                    threads: 1,
+                    ..Default::default()
                 }
                 .boxed(),
                 optimal: Optimal::Neither,
                 use_for_bench: false,
             },
         ),
-        #[cfg(feature = "ilp-cbc")]
+        #[cfg(feature = "ilp-any")]
         (
             "delay-budget-ilp-cbc-timeout",
             ExtractorDetail {
@@ -136,6 +144,8 @@ pub fn extractors() -> IndexMap<&'static str, ExtractorDetail> {
                 extractor: extract::ilp_cbc::DelayBudgetCbcExtractor {
                     timeout_seconds: 10,
                     max_delay: 100.0,
+                    threads: 1,
+                    ..Default::default()
                 }
                 .boxed(),
                 optimal: Optimal::Neither,

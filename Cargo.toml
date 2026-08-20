@@ -6,7 +6,29 @@ version = "0.1.0"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
-ilp-cbc = ["coin_cbc"]
+# --- MILP backend selection ------------------------------------------------
+# The ILP extractors talk to the solver through the `milp::MilpModel` trait.
+# Exactly ONE backend feature may be enabled; enabling two is a hard
+# `compile_error!` (see src/milp/mod.rs) rather than a silent precedence rule,
+# because Cargo features are additive and a silently-ignored backend would make
+# a solver benchmark meaningless.
+#
+#   ilp-cbc     COIN-OR CBC via the `coin_cbc` crate. The baseline.
+#   ilp-gurobi  Gurobi 10 via `grb`. Needs GUROBI_HOME, GRB_LICENSE_FILE and
+#               $GUROBI_HOME/lib on LD_LIBRARY_PATH at build *and* run time
+#               (the shipped libgurobi100.so has no SONAME). If your Gurobi
+#               licence is a single token, do not run two Gurobi processes
+#               concurrently.
+#   ilp-highs   HiGHS 1.15 via the raw `highs-sys` FFI. Vendors and cmake-builds
+#               HiGHS itself (~4 min cold). The final link needs libstdc++ on
+#               the search path; build.rs adds it.
+#
+# `ilp-any` is the internal umbrella every backend turns on; it is what gates
+# the `milp` module and the ILP extractors. Do not enable it directly.
+ilp-any = []
+ilp-cbc = ["ilp-any", "dep:coin_cbc"]
+ilp-gurobi = ["ilp-any", "dep:grb"]
+ilp-highs = ["ilp-any", "dep:highs-sys"]
 
 [dependencies]
 env_logger = { version = "0.10.0", default-features = false }
@@ -18,6 +40,13 @@ rand = "0.8.5"
 walkdir = "2.4.0"
 anyhow = "1.0.71"
 coin_cbc = { version = "0.1.6", optional = true }
+# Raw HiGHS C FFI. Deliberately NOT the high-level `highs` crate: that one hides
+# incremental model modification and the MIP start behind a builder API.
+highs-sys = { version = "1.15", optional = true }
+# Pinned to the Gurobi 10 ABI; change the feature to match your installed Gurobi.
+grb = { version = "3.0.1", default-features = false, features = [
+    "gurobi10",
+], optional = true }
 im-rc = "15.1.0"
 rustc-hash = "1.1.0"
 serde_json = "1.0"
