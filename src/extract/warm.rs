@@ -62,7 +62,6 @@ use crate::{ClassId, EGraph, ExtractionResult, NodeId};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WarmStartMode {
     /// No MIP start. The historical behaviour and still the default.
-    #[default]
     None,
     /// Seed from the caller-supplied *initial* extraction — typically the
     /// input design's own mapping. This is the seed that is feasible by
@@ -72,6 +71,8 @@ pub enum WarmStartMode {
     /// If the caller supplies no seed, [`super::ilp_cbc`] refuses the warm
     /// start with a note and solves with no MIP start (it used to degrade to
     /// [`Self::Greedy`]; see that variant).
+    ///
+    #[default]
     Initial,
     /// Seed from a greedy extraction of the same e-graph.
     ///
@@ -255,8 +256,7 @@ impl SolveReport {
             std::path::Path::new(path),
             self.backend,
         );
-        self.time_to_first_incumbent_secs =
-            crate::milp::trajectory::time_to_first_incumbent(&traj);
+        self.time_to_first_incumbent_secs = crate::milp::trajectory::time_to_first_incumbent(&traj);
         self.trajectory = traj;
     }
 }
@@ -401,7 +401,13 @@ pub fn arrival_times(
 ) -> Result<IndexMap<ClassId, f64>, String> {
     let mut arrival: IndexMap<ClassId, f64> = IndexMap::default();
     for root in roots {
-        arrival_of(egraph, root, selection, &mut arrival, &mut IndexSet::default())?;
+        arrival_of(
+            egraph,
+            root,
+            selection,
+            &mut arrival,
+            &mut IndexSet::default(),
+        )?;
     }
     Ok(arrival)
 }
