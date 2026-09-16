@@ -13,8 +13,9 @@ Four extractors, each one [`IlpObjective`] over the single model in
 
 Every extractor takes [`IlpOptions`] (time limit, default
 [`DEFAULT_TIME_LIMIT`] = 10 s; threads; [`WarmStart`], default initial) and
-always returns a complete extraction: if the solver fails, the better of the
-initial and greedy extractions is returned instead (see [`solve`]).
+returns a complete extraction. If the solver fails, the warm start decides
+the fallback: the initial extraction for `Initial`, the better of initial and
+greedy for `Greedy`, and an `IlpError::NoSolution` for `None` (see [`solve`]).
 
 Sizes come from `Node::cost`, depths from `Node::delay`, and the initial
 expression from `Node::initial`:

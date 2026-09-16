@@ -33,17 +33,22 @@ impl Candidate {
     }
 }
 
-/// The initial extraction (if any) followed by the objective's greedy one.
+/// The initial extraction (if any), then the objective's greedy extraction if
+/// `with_greedy`. Empty only when there is neither.
 pub(crate) fn candidates(
     egraph: &EGraph,
     roots: &[ClassId],
     objective: IlpObjective,
     initial: Option<CompleteExtraction>,
+    with_greedy: bool,
 ) -> Result<Vec<Candidate>, IlpError> {
     let mut candidates: Vec<Candidate> = initial
         .map(|e| Candidate::new("initial", e, egraph, roots, objective))
         .into_iter()
         .collect();
+    if !with_greedy {
+        return Ok(candidates);
+    }
 
     let (name, extractor) = objective.greedy_extractor();
     match CompleteExtraction::try_new(extractor.extract(egraph, roots), egraph, roots) {
@@ -59,11 +64,12 @@ pub(crate) fn candidates(
 }
 
 /// Index of the best candidate under `objective`, and whether it violates the
-/// depth budget. Ties go to the earlier candidate, i.e. the initial one.
+/// depth budget; `None` if there are no candidates. Ties go to the earlier
+/// candidate, i.e. the initial one.
 ///
 /// With a depth budget, candidates within budget are compared by size; if
 /// none is, the shallowest is returned and flagged.
-pub(crate) fn best(objective: IlpObjective, candidates: &[Candidate]) -> (usize, bool) {
+pub(crate) fn best(objective: IlpObjective, candidates: &[Candidate]) -> Option<(usize, bool)> {
     let min_by = |key: fn(&Candidate) -> f64, within: &dyn Fn(&Candidate) -> bool| {
         candidates
             .iter()
@@ -72,17 +78,12 @@ pub(crate) fn best(objective: IlpObjective, candidates: &[Candidate]) -> (usize,
             .min_by(|(_, a), (_, b)| key(a).total_cmp(&key(b)))
             .map(|(i, _)| i)
     };
+    let any = |_: &Candidate| true;
     match objective.budget_value() {
-        None => (
-            min_by(|c| c.objective, &|_| true).expect("at least one candidate"),
-            false,
-        ),
+        None => min_by(|c| c.objective, &any).map(|i| (i, false)),
         Some(budget) => match min_by(|c| c.objective, &|c| c.depth <= budget) {
-            Some(i) => (i, false),
-            None => (
-                min_by(|c| c.depth, &|_| true).expect("at least one candidate"),
-                true,
-            ),
+            Some(i) => Some((i, false)),
+            None => min_by(|c| c.depth, &any).map(|i| (i, true)),
         },
     }
 }

@@ -12,7 +12,7 @@ use extraction_gym::extract::ilp::*;
 let options = IlpOptions::default()                  // 10 s, WarmStart::Initial, 1 thread
     .with_time_limit(Duration::from_secs(60));
 let outcome = SizeConstrainedDepthExtractor { depth_budget: DepthBudget::Initial, options }
-    .solve(&egraph, &roots)?;                        // Err only for an invalid request
+    .solve(&egraph, &roots)?;                        // Err: invalid request, or no solution with WarmStart::None
 
 let extraction = outcome.extraction;                 // CompleteExtraction
 match outcome.report.outcome {                       // SolveReport
@@ -36,26 +36,29 @@ extractor also implements `Extractor` (panicking on an invalid request).
 
 ## Warm start and fallback
 
-Two candidate extractions are computed before every solve:
+The warm start also decides the **fallback**, returned when the solver
+produces nothing usable. Only what it needs is computed: greedy extraction can
+be slow on large e-graphs.
 
-* **initial**: `greedy::InitialExtractor`, from the `Node::initial` flags
-* **greedy**: `GreedyDepthExtractor` for `Depth` and `SizeConstrainedDepth`,
-  otherwise `GreedySizeExtractor`
+| `WarmStart` | Computes | Seed | Fallback |
+|---|---|---|---|
+| `None` | nothing | none | none: `IlpError::NoSolution { reason, report }` |
+| `Initial` (default) | initial | initial | initial (error up front if nothing is flagged) |
+| `Greedy` | initial (if flagged) + greedy | the better of the two | the same |
 
-The **fallback** is the better of the two under the objective. With a depth
-budget, candidates within budget are compared by size; if none is, the
-shallowest is returned with `report.depth_budget_violated = true`.
-
-| `WarmStart` | Seed |
-|---|---|
-| `None` | no MIP start |
-| `Initial` (default) | the initial candidate; error if nothing is flagged |
-| `Greedy` | the fallback |
+* **initial** is `greedy::InitialExtractor`, from the `Node::initial` flags.
+* **greedy** is `GreedyDepthExtractor` for `Depth` and `SizeConstrainedDepth`,
+  otherwise `GreedySizeExtractor`.
+* "Better" is by the objective. With a depth budget, candidates within budget
+  are compared by size; if none is, the shallowest is returned with
+  `report.depth_budget_violated = true`.
+* `DepthBudget::Initial` needs the initial expression whatever the warm start.
 
 The fallback is returned when the solver produces no solution in time, the
 budget is infeasible, the solution is invalid, a timed-out incumbent is worse
 than the fallback, or the backend panics. The reason is in
-`SolveOutcome::Fallback { reason }`.
+`SolveOutcome::Fallback { reason }`. `SolveReport` also times each stage:
+`initial_wall_secs`, `greedy_wall_secs`, `build_wall_secs`, `solve_wall_secs`.
 
 ## Flow of `solve` (`solve.rs`)
 

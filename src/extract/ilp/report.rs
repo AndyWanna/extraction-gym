@@ -59,6 +59,13 @@ pub struct SolveReport {
     pub best_bound: Option<f64>,
     /// `|obj - bound| / max(|obj|, 1e-10)`.
     pub gap: Option<f64>,
+    /// Wall-clock time to extract and validate the initial expression, if it
+    /// was needed.
+    pub initial_wall_secs: Option<f64>,
+    /// Wall-clock time to compute the greedy extraction (`WarmStart::Greedy`).
+    pub greedy_wall_secs: Option<f64>,
+    /// Wall-clock time to build the model and push the warm start.
+    pub build_wall_secs: f64,
     /// Wall-clock time spent inside the solve loop (excludes model building).
     pub solve_wall_secs: f64,
     /// How many times `solve()` was called (the cycle-breaking loop re-solves).
@@ -103,6 +110,9 @@ impl SolveReport {
             objective: None,
             best_bound: None,
             gap: None,
+            initial_wall_secs: None,
+            greedy_wall_secs: None,
+            build_wall_secs: 0.0,
             solve_wall_secs: 0.0,
             num_solves: 0,
             outcome: SolveOutcome::Fallback {

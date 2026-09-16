@@ -44,11 +44,18 @@ fn flag_initial(egraph: &mut EGraph, extraction: &ExtractionResult) {
     }
 }
 
+/// With no time to solve, the warm start decides the result: `None` has no
+/// fallback, `Initial` returns the initial extraction, `Greedy` the better
+/// candidate. Only `Greedy` pays for a greedy extraction.
 #[test]
-fn zero_time_limit_still_returns_a_complete_extraction() {
+fn zero_time_limit_falls_back_according_to_the_warm_start() {
     for _ in 0..EGRAPHS {
-        let egraph = generate_random_egraph();
+        let mut egraph = generate_random_egraph();
         let roots = egraph.root_eclasses.clone();
+        let initial = GreedyDepthExtractor.extract(&egraph, &roots);
+        flag_initial(&mut egraph, &initial);
+        let initial = CompleteExtraction::try_new(initial, &egraph, &roots).unwrap();
+
         let objectives = [
             IlpObjective::Size,
             IlpObjective::Depth,
@@ -61,12 +68,39 @@ fn zero_time_limit_still_returns_a_complete_extraction() {
             },
         ];
         for objective in objectives {
-            for warm_start in [WarmStart::None, WarmStart::Greedy] {
+            let solve_with = |warm_start| {
                 let opts = options(Some(Duration::ZERO), warm_start);
-                let outcome = solve::<DefaultMilp>(&egraph, &roots, objective, &opts).unwrap();
-                assert!(outcome.extraction.is_complete(&egraph, &roots));
-                assert!(!outcome.report.depth_budget_violated);
+                solve::<DefaultMilp>(&egraph, &roots, objective, &opts)
+            };
+
+            match solve_with(WarmStart::None) {
+                Err(IlpError::NoSolution { report, .. }) => {
+                    assert_eq!(report.greedy_wall_secs, None);
+                    assert_eq!(report.initial_wall_secs, None);
+                }
+                Ok(outcome) => assert!(!matches!(
+                    outcome.report.outcome,
+                    SolveOutcome::Fallback { .. }
+                )),
+                Err(e) => panic!("{e}"),
             }
+
+            let outcome = solve_with(WarmStart::Initial).unwrap();
+            assert_eq!(outcome.report.greedy_wall_secs, None);
+            if matches!(outcome.report.outcome, SolveOutcome::Fallback { .. }) {
+                assert_eq!(
+                    outcome.extraction.dag_cost(&egraph, &roots),
+                    initial.dag_cost(&egraph, &roots)
+                );
+                assert_eq!(
+                    outcome.extraction.dag_depth(&egraph, &roots),
+                    initial.dag_depth(&egraph, &roots)
+                );
+            }
+
+            let outcome = solve_with(WarmStart::Greedy).unwrap();
+            assert!(outcome.report.greedy_wall_secs.is_some());
+            assert!(!outcome.report.depth_budget_violated);
         }
     }
 }
@@ -85,7 +119,7 @@ fn infeasible_budget_returns_the_shallowest_candidate_flagged() {
         let objective = IlpObjective::SizeConstrainedDepth {
             depth_budget: DepthBudget::Fixed(best_depth / 2.0),
         };
-        let opts = options(None, WarmStart::None);
+        let opts = options(None, WarmStart::Greedy);
         let outcome = solve::<DefaultMilp>(&egraph, &roots, objective, &opts).unwrap();
         assert!(matches!(
             outcome.report.outcome,

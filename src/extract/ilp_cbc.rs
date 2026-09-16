@@ -186,8 +186,8 @@ fn extract_delay_budget<M: MilpModel>(
 /// Adapter from the legacy fields onto [`ilp::solve`](super::ilp::solve).
 ///
 /// `warm.seed` plays the role of the initial extraction (repaired onto this
-/// e-graph by `build_seed`). `WarmStartMode::Initial` without a seed runs with
-/// no MIP start, as it always has.
+/// e-graph by `build_seed`). `WarmStartMode::Initial` without a seed becomes
+/// `Greedy`, so these extractors keep a fallback.
 fn run<M: MilpModel>(
     egraph: &EGraph,
     roots: &[ClassId],
@@ -207,7 +207,7 @@ fn run<M: MilpModel>(
         }
     });
     let warm_start = match (warm.mode, &initial) {
-        (WarmStart::Initial, None) => WarmStart::None,
+        (WarmStart::Initial, None) => WarmStart::Greedy,
         (mode, _) => mode,
     };
     let options = IlpOptions {
@@ -217,7 +217,7 @@ fn run<M: MilpModel>(
         solver_log: warm.milp_log.as_ref().map(PathBuf::from),
         raw_params: Vec::new(),
     };
-    match solve_with_initial::<M>(egraph, roots, objective, &options, initial) {
+    match solve_with_initial::<M>(egraph, roots, objective, &options, initial, None) {
         Ok(outcome) => (outcome.extraction.into_inner(), outcome.report),
         Err(e) => {
             log::warn!(

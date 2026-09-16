@@ -10,7 +10,7 @@ use std::time::Instant;
 use super::decode::decode_selection;
 use super::fallback::{self, Candidate};
 use super::model::{self, IlpVars};
-use super::{warm, IlpObjective, IlpOptions, SolveOutcome, SolveReport, WarmStart};
+use super::{warm, DepthBudget, IlpObjective, IlpOptions, SolveOutcome, SolveReport, WarmStart};
 use crate::extract::greedy::initial::{has_initial_nodes, InitialExtractor};
 use crate::milp::{MilpModel, MilpSolution};
 use crate::*;
@@ -21,19 +21,24 @@ pub struct IlpOutcome {
     pub report: SolveReport,
 }
 
-/// Why an ILP extraction could not be attempted. All of these are problems
-/// with the request, detected before solving; nothing the solver does
-/// produces an error.
-#[derive(Debug, Clone, PartialEq)]
+/// Why an ILP extraction produced no extraction.
+#[derive(Debug, Clone)]
 pub enum IlpError {
     NoRoots,
     /// A negative or non-finite size/depth, weight or budget.
     InvalidInput(String),
-    /// `WarmStart::Initial` was requested but the e-graph's `Node::initial`
-    /// flags do not describe a complete extraction of the roots.
+    /// `WarmStart::Initial` or `DepthBudget::Initial` was requested but the
+    /// e-graph's `Node::initial` flags do not describe a complete extraction
+    /// of the roots.
     MissingInitial(String),
     /// The e-graph has no acyclic extraction of the roots at all.
     NoValidExtraction(String),
+    /// The solver produced no usable solution and, with `WarmStart::None`,
+    /// there is no fallback extraction to return.
+    NoSolution {
+        reason: String,
+        report: Box<SolveReport>,
+    },
 }
 
 impl std::fmt::Display for IlpError {
@@ -43,9 +48,15 @@ impl std::fmt::Display for IlpError {
             IlpError::InvalidInput(why) => write!(f, "invalid input: {why}"),
             IlpError::MissingInitial(why) => write!(
                 f,
-                "warm start 'initial' needs the initial expression flagged with Node::initial: {why}"
+                "the initial expression is needed but not flagged with Node::initial: {why}"
             ),
-            IlpError::NoValidExtraction(why) => write!(f, "the e-graph has no valid extraction: {why}"),
+            IlpError::NoValidExtraction(why) => {
+                write!(f, "the e-graph has no valid extraction: {why}")
+            }
+            IlpError::NoSolution { reason, .. } => write!(
+                f,
+                "{reason}, and WarmStart::None has no fallback extraction"
+            ),
         }
     }
 }
@@ -54,37 +65,58 @@ impl std::error::Error for IlpError {}
 
 /// Extract `roots` from `egraph` minimising `objective`.
 ///
-/// Always returns a complete extraction unless the request itself is invalid.
-/// If the solver fails for any reason (no solution within the time limit, an
-/// infeasible depth budget, an invalid solution, a panic in the backend) the
-/// fallback is returned: the better, under `objective`, of the initial
-/// extraction (when `Node::initial` is flagged) and the objective's greedy
-/// extraction. See [`SolveReport::outcome`].
+/// The warm start also decides the fallback, returned when the solver
+/// produces nothing usable (no solution within the time limit, an infeasible
+/// depth budget, an invalid solution, an incumbent worse than the fallback, a
+/// panic in the backend):
+///
+/// | `WarmStart` | Fallback |
+/// |---|---|
+/// | `None` | none: `IlpError::NoSolution` |
+/// | `Initial` | the initial extraction |
+/// | `Greedy` | the better of the initial (if flagged) and greedy extractions |
+///
+/// Only what the warm start needs is computed, since greedy extraction can be
+/// slow on large e-graphs. See [`SolveReport::outcome`].
 pub fn solve<M: MilpModel>(
     egraph: &EGraph,
     roots: &[ClassId],
     objective: IlpObjective,
     options: &IlpOptions,
 ) -> Result<IlpOutcome, IlpError> {
-    let initial = if has_initial_nodes(egraph) {
+    let needs_initial = options.warm_start != WarmStart::None
+        || objective.depth_budget() == Some(DepthBudget::Initial);
+    let required = options.warm_start == WarmStart::Initial
+        || objective.depth_budget() == Some(DepthBudget::Initial);
+
+    let clock = Instant::now();
+    let initial = if !needs_initial {
+        None
+    } else if !has_initial_nodes(egraph) {
+        None
+    } else {
         let extraction = InitialExtractor.extract(egraph, roots);
         match CompleteExtraction::try_new(extraction, egraph, roots) {
             Ok(e) => Some(e),
-            Err(why) if options.warm_start == WarmStart::Initial => {
-                return Err(IlpError::MissingInitial(why))
-            }
+            Err(why) if required => return Err(IlpError::MissingInitial(why)),
             Err(why) => {
                 log::warn!("ignoring the flagged initial expression: {why}");
                 None
             }
         }
-    } else {
-        None
     };
-    if options.warm_start == WarmStart::Initial && initial.is_none() {
+    if required && initial.is_none() {
         return Err(IlpError::MissingInitial("no node is flagged".to_string()));
     }
-    solve_with_initial::<M>(egraph, roots, objective, options, initial)
+    let initial_wall_secs = needs_initial.then(|| clock.elapsed().as_secs_f64());
+    solve_with_initial::<M>(
+        egraph,
+        roots,
+        objective,
+        options,
+        initial,
+        initial_wall_secs,
+    )
 }
 
 /// [`solve`] with the initial extraction supplied by the caller rather than
@@ -95,6 +127,7 @@ pub(crate) fn solve_with_initial<M: MilpModel>(
     objective: IlpObjective,
     options: &IlpOptions,
     initial: Option<CompleteExtraction>,
+    initial_wall_secs: Option<f64>,
 ) -> Result<IlpOutcome, IlpError> {
     let initial_depth = initial
         .as_ref()
@@ -107,10 +140,6 @@ pub(crate) fn solve_with_initial<M: MilpModel>(
         warn_depth_objective();
     }
 
-    let candidates = fallback::candidates(egraph, roots, objective, initial)?;
-    let (best, budget_violated) = fallback::best(objective, &candidates);
-    let fallback = &candidates[best];
-
     let mut report = SolveReport::new(
         M::NAME,
         objective.name(),
@@ -118,13 +147,25 @@ pub(crate) fn solve_with_initial<M: MilpModel>(
         options.time_limit,
         options.warm_start,
     );
-    report.fallback_objective = Some(fallback.objective);
     report.depth_budget = objective.budget_value();
+    report.initial_wall_secs = initial_wall_secs;
+
+    let with_greedy = options.warm_start == WarmStart::Greedy;
+    let clock = Instant::now();
+    let candidates = fallback::candidates(egraph, roots, objective, initial, with_greedy)?;
+    if with_greedy {
+        report.greedy_wall_secs = Some(clock.elapsed().as_secs_f64());
+    }
+    let fallback = fallback::best(objective, &candidates);
+    let (best, budget_violated) = match fallback {
+        Some((best, violated)) => (Some(&candidates[best]), violated),
+        None => (None, false),
+    };
+    report.fallback_objective = best.map(|c| c.objective);
 
     let seed = match options.warm_start {
         WarmStart::None => None,
-        WarmStart::Initial => candidates.iter().find(|c| c.name == "initial"),
-        WarmStart::Greedy => Some(fallback),
+        WarmStart::Initial | WarmStart::Greedy => best,
     };
 
     let solved = catch_unwind(AssertUnwindSafe(|| {
@@ -139,30 +180,41 @@ pub(crate) fn solve_with_initial<M: MilpModel>(
         Err(format!("the solver panicked: {msg}"))
     });
 
-    let reason = match solved {
-        Ok((extraction, true)) => {
+    let reason = match (solved, best) {
+        (Ok((extraction, true)), _) => {
             report.outcome = SolveOutcome::Optimal;
             return Ok(IlpOutcome { extraction, report });
         }
-        Ok((extraction, false)) => {
+        (Ok((extraction, false)), best) => {
             let value = objective.evaluate(egraph, roots, &extraction);
-            if budget_violated || value <= fallback.objective + EPSILON_ALLOWANCE {
-                report.outcome = SolveOutcome::Incumbent;
-                return Ok(IlpOutcome { extraction, report });
+            match best {
+                Some(b) if !budget_violated && value > b.objective + EPSILON_ALLOWANCE => format!(
+                    "the solver's incumbent ({value}) is worse than the {} extraction ({})",
+                    b.name, b.objective
+                ),
+                _ => {
+                    report.outcome = SolveOutcome::Incumbent;
+                    return Ok(IlpOutcome { extraction, report });
+                }
             }
-            format!(
-                "the solver's incumbent ({value}) is worse than the {} extraction ({})",
-                fallback.name, fallback.objective
-            )
         }
-        Err(reason) => reason,
+        (Err(reason), _) => reason,
     };
 
+    let Some((best, _)) = fallback else {
+        report.outcome = SolveOutcome::Fallback {
+            reason: reason.clone(),
+        };
+        return Err(IlpError::NoSolution {
+            reason,
+            report: Box::new(report),
+        });
+    };
     log::warn!(
         "{} ILP on {}: {reason}; returning the {} extraction",
         objective.name(),
         M::NAME,
-        fallback.name
+        candidates[best].name
     );
     report.outcome = SolveOutcome::Fallback { reason };
     report.depth_budget_violated = budget_violated;
@@ -229,6 +281,7 @@ fn run_solver<M: MilpModel>(
         report.solver_log = Some(path);
     }
 
+    let build_clock = Instant::now();
     let vars = model::build(&mut model, egraph, roots, objective);
     if let Some(seed) = seed {
         apply_seed(
@@ -241,6 +294,8 @@ fn run_solver<M: MilpModel>(
             report,
         );
     }
+
+    report.build_wall_secs = build_clock.elapsed().as_secs_f64();
 
     let solve_clock = Instant::now();
     let solution = model.solve();
