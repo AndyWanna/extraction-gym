@@ -27,6 +27,7 @@ pub struct ExtractorDetail {
     pub use_for_bench: bool,
 }
 
+#[allow(deprecated)]
 pub fn extractors() -> IndexMap<&'static str, ExtractorDetail> {
     let extractors: IndexMap<&'static str, ExtractorDetail> = [
         (
@@ -61,6 +62,14 @@ pub fn extractors() -> IndexMap<&'static str, ExtractorDetail> {
                 use_for_bench: true,
             },
         ),
+        (
+            "greedy-depth",
+            ExtractorDetail {
+                extractor: extract::greedy::GreedyDepthExtractor.boxed(),
+                optimal: Optimal::Neither,
+                use_for_bench: true,
+            },
+        ),
         /*(
             "global-greedy-dag",
             ExtractorDetail {
@@ -69,6 +78,76 @@ pub fn extractors() -> IndexMap<&'static str, ExtractorDetail> {
                 use_for_bench: true,
             },
         ),*/
+        // The ILP extractors. Benchmark e-graphs carry no Node::initial flags,
+        // so these seed from the greedy extraction rather than the initial one.
+        #[cfg(feature = "ilp-any")]
+        (
+            "ilp-size-timeout",
+            ExtractorDetail {
+                extractor: extract::ilp::SizeExtractor {
+                    options: bench_ilp_options(Some(10)),
+                }
+                .boxed(),
+                optimal: Optimal::Dag,
+                use_for_bench: true,
+            },
+        ),
+        #[cfg(feature = "ilp-any")]
+        (
+            "ilp-size",
+            ExtractorDetail {
+                extractor: extract::ilp::SizeExtractor {
+                    options: bench_ilp_options(None),
+                }
+                .boxed(),
+                optimal: Optimal::Dag,
+                use_for_bench: false, // takes >10 hours sometimes
+            },
+        ),
+        #[cfg(feature = "ilp-any")]
+        (
+            "ilp-depth-timeout",
+            ExtractorDetail {
+                extractor: extract::ilp::DepthExtractor {
+                    options: bench_ilp_options(Some(10)),
+                }
+                .boxed(),
+                optimal: Optimal::Neither,
+                use_for_bench: false,
+            },
+        ),
+        #[cfg(feature = "ilp-any")]
+        (
+            "ilp-weighted-size-depth-timeout",
+            ExtractorDetail {
+                // Not a size optimum, so Optimal::Neither.
+                extractor: extract::ilp::WeightedSizeDepthExtractor {
+                    size_weight: 1.0,
+                    depth_weight: 1.0,
+                    options: bench_ilp_options(Some(10)),
+                }
+                .boxed(),
+                optimal: Optimal::Neither,
+                use_for_bench: false,
+            },
+        ),
+        #[cfg(feature = "ilp-any")]
+        (
+            "ilp-size-constrained-depth-timeout",
+            ExtractorDetail {
+                // The budget is an arbitrary placeholder: infeasible on some
+                // e-graphs (returning the flagged shallowest fallback) and
+                // slack on others.
+                extractor: extract::ilp::SizeConstrainedDepthExtractor {
+                    depth_budget: 100.0,
+                    options: bench_ilp_options(Some(10)),
+                }
+                .boxed(),
+                optimal: Optimal::Neither,
+                use_for_bench: false,
+            },
+        ),
+        // Deprecated extractors, kept under their original keys.
         #[cfg(feature = "ilp-any")]
         (
             "ilp-cbc-timeout",
@@ -158,6 +237,15 @@ pub fn extractors() -> IndexMap<&'static str, ExtractorDetail> {
     extractors
 }
 
+
+#[cfg(feature = "ilp-any")]
+fn bench_ilp_options(time_limit_seconds: Option<u64>) -> extract::ilp::IlpOptions {
+    extract::ilp::IlpOptions {
+        time_limit: time_limit_seconds.map(std::time::Duration::from_secs),
+        warm_start: extract::ilp::WarmStart::Greedy,
+        ..Default::default()
+    }
+}
 
 #[cfg(test)]
 pub mod test;

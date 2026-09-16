@@ -1,5 +1,6 @@
 /*
-Not the default DAG-area extractor any more; see ilp_cbc::IlpExtractor.
+Deprecated: this model is simplified and blocks cycles lazily (re-solving
+when a solution has one). Use ilp::SizeExtractor, which blocks cycles exactly.
 
 The lazy cycle loop below discards any timed-out solution that still contains a
 cycle, so at a short time cap it returns the greedy seed almost every time.
@@ -59,6 +60,8 @@ we get an optimal solution without cycles.
 
 */
 
+#![allow(deprecated)]
+
 use super::ilp::options::time_limit_from_seconds;
 use super::warm::{SolveOutcome, SolveReport, WarmStartMode};
 use super::*;
@@ -68,6 +71,7 @@ use std::fmt;
 use std::time::{Instant, SystemTime};
 
 #[derive(Debug)]
+#[deprecated(note = "faster_ilp_cbc is deprecated; use ilp::SizeExtractor")]
 pub struct Config {
     pub pull_up_costs: bool,
     pub remove_self_loops: bool,
@@ -191,6 +195,7 @@ impl<C: Copy> ClassILP<C> {
 /// starts did not turn every struct-literal construction site into a churn
 /// point (`..Default::default()` covers it).
 #[derive(Default, Clone)]
+#[deprecated(note = "use ilp::IlpOptions")]
 pub struct WarmConfig {
     /// Which starting incumbent to use.
     pub mode: WarmStartMode,
@@ -211,12 +216,14 @@ fn fallback(reason: &str) -> SolveOutcome {
 
 /// Simplifying DAG-optimal ILP extractor with a compile-time timeout.
 /// Backend-generic; [`FasterCbcExtractorWithTimeout`] is the legacy spelling.
+#[deprecated(note = "its cycle constraints are lazy and its model is simplified; use ilp::SizeExtractor")]
 pub struct FasterIlpExtractorWithTimeout<const TIMEOUT_IN_SECONDS: u32>;
 
 /// Legacy name for [`FasterIlpExtractorWithTimeout`].
 /// NOTE: a type alias to a *unit* struct cannot be used in expression position
 /// (`FasterCbcExtractorWithTimeout::<10>` as a value is rejected by rustc), so
 /// construct it with `::new()` or use the neutral name directly.
+#[deprecated(note = "its cycle constraints are lazy and its model is simplified; use ilp::SizeExtractor")]
 pub type FasterCbcExtractorWithTimeout<const TIMEOUT_IN_SECONDS: u32> =
     FasterIlpExtractorWithTimeout<TIMEOUT_IN_SECONDS>;
 
@@ -264,6 +271,7 @@ impl<const TIMEOUT_IN_SECONDS: u32> FasterIlpExtractorWithTimeout<TIMEOUT_IN_SEC
 
 /// Simplifying DAG-optimal ILP extractor with a runtime timeout.
 /// Backend-generic; [`FasterCbcExtractor`] is the legacy spelling.
+#[deprecated(note = "its cycle constraints are lazy and its model is simplified; use ilp::SizeExtractor")]
 pub struct FasterIlpExtractor {
     /// Solver time limit in seconds (`u32::MAX` for unbounded).
     ///
@@ -290,6 +298,7 @@ impl Default for FasterIlpExtractor {
 }
 
 /// Legacy name for [`FasterIlpExtractor`].
+#[deprecated(note = "its cycle constraints are lazy and its model is simplified; use ilp::SizeExtractor")]
 pub type FasterCbcExtractor = FasterIlpExtractor;
 
 impl Extractor for FasterIlpExtractor {

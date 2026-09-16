@@ -7,13 +7,15 @@ Each struct here is one `ilp::IlpObjective` solved by `ilp::solve`:
   DelayBudgetIlpExtractor   SizeConstrainedDepth { depth_budget: max_delay }
 
 so they share its guarantee: the result is complete unless the input itself is
-invalid (then it is empty). New code should use the `ilp` extractors directly.
+invalid (then it is empty). Deprecated: use the `ilp` extractors directly.
 
 The public extractor structs default to `milp::DefaultMilp` (the one backend
 feature that is enabled), and `*_with::<M>()` methods let a caller pin a
 backend explicitly. The historical `*CbcExtractor` names are kept as type
 aliases so downstream crates don't have to change.
 */
+
+#![allow(deprecated)]
 
 use super::faster_ilp_cbc::WarmConfig;
 use super::ilp::options::time_limit_from_seconds;
@@ -25,6 +27,7 @@ use std::path::PathBuf;
 
 /// DAG-optimal ILP extractor with a compile-time timeout. Backend-generic; use
 /// [`CbcExtractorWithTimeout`] for the previous (CBC) spelling.
+#[deprecated(note = "use ilp::SizeExtractor with IlpOptions::time_limit")]
 pub struct IlpExtractorWithTimeout<const TIMEOUT_IN_SECONDS: u32>;
 
 /// Legacy name for [`IlpExtractorWithTimeout`].
@@ -32,6 +35,7 @@ pub struct IlpExtractorWithTimeout<const TIMEOUT_IN_SECONDS: u32>;
 /// NOTE: a type alias to a *unit* struct cannot be used in expression position
 /// (`CbcExtractorWithTimeout::<10>` as a value is rejected by rustc), so
 /// construct it with `::new()` or use the neutral name directly.
+#[deprecated(note = "use ilp::SizeExtractor with IlpOptions::time_limit")]
 pub type CbcExtractorWithTimeout<const TIMEOUT_IN_SECONDS: u32> =
     IlpExtractorWithTimeout<TIMEOUT_IN_SECONDS>;
 
@@ -67,6 +71,7 @@ impl<const TIMEOUT_IN_SECONDS: u32> IlpExtractorWithTimeout<TIMEOUT_IN_SECONDS> 
 
 /// DAG-optimal ILP extractor with a runtime timeout. Backend-generic; use
 /// [`CbcExtractor`] for the previous (CBC) spelling.
+#[deprecated(note = "use ilp::SizeExtractor")]
 pub struct IlpExtractor {
     /// Solver time limit in seconds (`u32::MAX` for unbounded).
     pub timeout_seconds: u32,
@@ -88,6 +93,7 @@ impl Default for IlpExtractor {
 }
 
 /// Legacy name for [`IlpExtractor`].
+#[deprecated(note = "use ilp::SizeExtractor")]
 pub type CbcExtractor = IlpExtractor;
 
 impl Extractor for IlpExtractor {
@@ -234,6 +240,7 @@ fn run<M: MilpModel>(
 
 /// Joint delay+area ILP extractor. Backend-generic; use [`DualCbcExtractor`]
 /// for the previous (CBC) spelling.
+#[deprecated(note = "use ilp::WeightedSizeDepthExtractor (alpha is depth_weight, beta is size_weight)")]
 pub struct DualIlpExtractor {
     /// Solver time limit in seconds (u32::MAX for unbounded).
     pub timeout_seconds: u32,
@@ -261,6 +268,7 @@ impl Default for DualIlpExtractor {
 }
 
 /// Legacy name for [`DualIlpExtractor`].
+#[deprecated(note = "use ilp::WeightedSizeDepthExtractor (alpha is depth_weight, beta is size_weight)")]
 pub type DualCbcExtractor = DualIlpExtractor;
 
 impl Extractor for DualIlpExtractor {
@@ -308,6 +316,7 @@ impl DualIlpExtractor {
 
 /// Minimum-area-under-a-delay-budget ILP extractor. Backend-generic; use
 /// [`DelayBudgetCbcExtractor`] for the previous (CBC) spelling.
+#[deprecated(note = "use ilp::SizeConstrainedDepthExtractor")]
 pub struct DelayBudgetIlpExtractor {
     /// Solver time limit in seconds (u32::MAX for unbounded).
     pub timeout_seconds: u32,
@@ -332,6 +341,7 @@ impl Default for DelayBudgetIlpExtractor {
 }
 
 /// Legacy name for [`DelayBudgetIlpExtractor`].
+#[deprecated(note = "use ilp::SizeConstrainedDepthExtractor")]
 pub type DelayBudgetCbcExtractor = DelayBudgetIlpExtractor;
 
 impl Extractor for DelayBudgetIlpExtractor {

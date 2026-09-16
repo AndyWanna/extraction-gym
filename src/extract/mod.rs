@@ -23,6 +23,7 @@ pub mod prio_queue;
 pub mod warm;
 
 #[cfg(feature = "ilp-any")]
+#[allow(deprecated)]
 pub use warm::{SolveReport, WarmStartMode};
 #[cfg(feature = "ilp-any")]
 pub use ilp::{IlpError, IlpObjective, IlpOptions, IlpOutcome, SolveOutcome, WarmStart};

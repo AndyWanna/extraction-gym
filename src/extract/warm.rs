@@ -7,4 +7,5 @@ pub use super::ilp::report::{SolveOutcome, SolveReport};
 pub use super::ilp::warm::{arrival_times, build_seed, topological_levels, try_dag_cost, Seed};
 
 /// Legacy name for [`super::ilp::WarmStart`].
+#[deprecated(note = "use ilp::WarmStart")]
 pub type WarmStartMode = super::ilp::WarmStart;
