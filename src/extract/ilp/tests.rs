@@ -53,7 +53,7 @@ fn zero_time_limit_still_returns_a_complete_extraction() {
             IlpObjective::Size,
             IlpObjective::Depth,
             IlpObjective::SizeConstrainedDepth {
-                depth_budget: min_depth(&egraph, &roots),
+                depth_budget: DepthBudget::Fixed(min_depth(&egraph, &roots)),
             },
             IlpObjective::WeightedSizeDepth {
                 size_weight: 1.0,
@@ -83,7 +83,7 @@ fn infeasible_budget_returns_the_shallowest_candidate_flagged() {
         }
         tested += 1;
         let objective = IlpObjective::SizeConstrainedDepth {
-            depth_budget: best_depth / 2.0,
+            depth_budget: DepthBudget::Fixed(best_depth / 2.0),
         };
         let opts = options(None, WarmStart::None);
         let outcome = solve::<DefaultMilp>(&egraph, &roots, objective, &opts).unwrap();
@@ -105,7 +105,7 @@ fn attainable_budget_is_met_and_no_larger_than_the_depth_extraction() {
         let depth_extraction = GreedyDepthExtractor.extract(&egraph, &roots);
         let budget = depth_extraction.dag_depth(&egraph, &roots).into_inner();
         let objective = IlpObjective::SizeConstrainedDepth {
-            depth_budget: budget,
+            depth_budget: DepthBudget::Fixed(budget),
         };
         let opts = options(None, WarmStart::Greedy);
         let outcome = solve::<DefaultMilp>(&egraph, &roots, objective, &opts).unwrap();
@@ -148,6 +148,43 @@ fn optimal_solutions_agree_with_the_objective_and_greedy_bounds() {
         let evaluated = weighted.evaluate(&egraph, &roots, &outcome.extraction);
         assert!(close(outcome.report.objective.unwrap(), evaluated));
     }
+}
+
+#[test]
+fn initial_depth_budget_keeps_the_initial_depth() {
+    for _ in 0..EGRAPHS {
+        let mut egraph = generate_random_egraph();
+        let roots = egraph.root_eclasses.clone();
+        let initial = GreedySizeExtractor.extract(&egraph, &roots);
+        flag_initial(&mut egraph, &initial);
+        let initial_depth = initial.dag_depth(&egraph, &roots).into_inner();
+
+        let objective = IlpObjective::SizeConstrainedDepth {
+            depth_budget: DepthBudget::Initial,
+        };
+        let opts = options(None, WarmStart::Initial);
+        let outcome = solve::<DefaultMilp>(&egraph, &roots, objective, &opts).unwrap();
+        let report = &outcome.report;
+        assert_eq!(report.depth_budget, Some(initial_depth));
+        assert_eq!(
+            report.warm_start_applied,
+            WarmStart::Initial,
+            "{:?}",
+            report.warm_start_note
+        );
+        assert_eq!(report.outcome, SolveOutcome::Optimal);
+        assert!(outcome.extraction.dag_depth(&egraph, &roots).into_inner() <= initial_depth);
+        assert!(outcome.extraction.dag_cost(&egraph, &roots) <= initial.dag_cost(&egraph, &roots));
+    }
+
+    // Without flags there is no initial depth to use.
+    let egraph = generate_random_egraph();
+    let roots = egraph.root_eclasses.clone();
+    let objective = IlpObjective::SizeConstrainedDepth {
+        depth_budget: DepthBudget::Initial,
+    };
+    let result = solve::<DefaultMilp>(&egraph, &roots, objective, &options(None, WarmStart::None));
+    assert!(matches!(result, Err(IlpError::MissingInitial(_))));
 }
 
 #[test]

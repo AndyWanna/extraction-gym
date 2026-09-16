@@ -14,6 +14,15 @@ Vocabulary, used throughout [`super`]:
 use crate::extract::greedy::{GreedyDepthExtractor, GreedySizeExtractor};
 use crate::*;
 
+/// The depth an [`IlpObjective::SizeConstrainedDepth`] extraction may not exceed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DepthBudget {
+    /// The depth of the initial expression: minimise size without making the
+    /// critical path any longer. The initial expression always meets it.
+    Initial,
+    Fixed(f64),
+}
+
 /// The quantity an ILP extraction minimises.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum IlpObjective {
@@ -29,7 +38,7 @@ pub enum IlpObjective {
     /// `size_weight` to break ties towards smaller extractions.
     Depth,
     /// Minimise size subject to depth `<= depth_budget`.
-    SizeConstrainedDepth { depth_budget: f64 },
+    SizeConstrainedDepth { depth_budget: DepthBudget },
     /// Minimise `size_weight * size + depth_weight * depth`.
     WeightedSizeDepth { size_weight: f64, depth_weight: f64 },
 }
@@ -44,10 +53,31 @@ impl IlpObjective {
         }
     }
 
-    pub fn depth_budget(&self) -> Option<f64> {
+    pub fn depth_budget(&self) -> Option<DepthBudget> {
         match self {
             IlpObjective::SizeConstrainedDepth { depth_budget } => Some(*depth_budget),
             _ => None,
+        }
+    }
+
+    /// The budget in depth units, once [`Self::resolve_budget`] has run.
+    pub(crate) fn budget_value(&self) -> Option<f64> {
+        self.depth_budget().map(|budget| match budget {
+            DepthBudget::Fixed(value) => value,
+            DepthBudget::Initial => panic!("DepthBudget::Initial must be resolved before solving"),
+        })
+    }
+
+    /// Replace [`DepthBudget::Initial`] with `initial_depth`. `None` if the
+    /// budget is `Initial` and there is no initial depth.
+    pub(crate) fn resolve_budget(self, initial_depth: Option<f64>) -> Option<Self> {
+        match self {
+            IlpObjective::SizeConstrainedDepth {
+                depth_budget: DepthBudget::Initial,
+            } => initial_depth.map(|depth| IlpObjective::SizeConstrainedDepth {
+                depth_budget: DepthBudget::Fixed(depth),
+            }),
+            other => Some(other),
         }
     }
 

@@ -96,6 +96,12 @@ pub(crate) fn solve_with_initial<M: MilpModel>(
     options: &IlpOptions,
     initial: Option<CompleteExtraction>,
 ) -> Result<IlpOutcome, IlpError> {
+    let initial_depth = initial
+        .as_ref()
+        .map(|e| e.dag_depth(egraph, roots).into_inner());
+    let objective = objective.resolve_budget(initial_depth).ok_or_else(|| {
+        IlpError::MissingInitial("DepthBudget::Initial needs the initial expression".to_string())
+    })?;
     validate(egraph, roots, objective)?;
     if objective == IlpObjective::Depth {
         warn_depth_objective();
@@ -113,6 +119,7 @@ pub(crate) fn solve_with_initial<M: MilpModel>(
         options.warm_start,
     );
     report.fallback_objective = Some(fallback.objective);
+    report.depth_budget = objective.budget_value();
 
     let seed = match options.warm_start {
         WarmStart::None => None,
@@ -181,7 +188,7 @@ fn validate(egraph: &EGraph, roots: &[ClassId], objective: IlpObjective) -> Resu
     let (size_weight, depth_weight) = objective.weights();
     non_negative("size_weight", size_weight)?;
     non_negative("depth_weight", depth_weight)?;
-    if let Some(budget) = objective.depth_budget() {
+    if let Some(budget) = objective.budget_value() {
         non_negative("depth_budget", budget)?;
     }
     Ok(())

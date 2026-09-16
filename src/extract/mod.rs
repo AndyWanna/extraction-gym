@@ -26,7 +26,7 @@ pub mod warm;
 #[allow(deprecated)]
 pub use warm::{SolveReport, WarmStartMode};
 #[cfg(feature = "ilp-any")]
-pub use ilp::{IlpError, IlpObjective, IlpOptions, IlpOutcome, SolveOutcome, WarmStart};
+pub use ilp::{DepthBudget, IlpError, IlpObjective, IlpOptions, IlpOutcome, SolveOutcome, WarmStart};
 
 // Allowance for floating point values to be considered equal
 pub const EPSILON_ALLOWANCE: f64 = 0.00001;

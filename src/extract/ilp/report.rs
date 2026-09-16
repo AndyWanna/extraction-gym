@@ -67,6 +67,8 @@ pub struct SolveReport {
     /// fields above describe the *solver's* attempt, not the returned
     /// extraction.
     pub outcome: SolveOutcome,
+    /// The depth budget enforced, with `DepthBudget::Initial` resolved.
+    pub depth_budget: Option<f64>,
     /// True when the returned extraction exceeds the depth budget. Only
     /// possible on `Fallback`, when no candidate met the budget.
     pub depth_budget_violated: bool,
@@ -106,6 +108,7 @@ impl SolveReport {
             outcome: SolveOutcome::Fallback {
                 reason: "not solved".to_string(),
             },
+            depth_budget: None,
             depth_budget_violated: false,
             solver_log: None,
             trajectory: Vec::new(),

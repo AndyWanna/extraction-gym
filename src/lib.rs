@@ -139,7 +139,7 @@ pub fn extractors() -> IndexMap<&'static str, ExtractorDetail> {
                 // e-graphs (returning the flagged shallowest fallback) and
                 // slack on others.
                 extractor: extract::ilp::SizeConstrainedDepthExtractor {
-                    depth_budget: 100.0,
+                    depth_budget: extract::ilp::DepthBudget::Fixed(100.0),
                     options: bench_ilp_options(Some(10)),
                 }
                 .boxed(),

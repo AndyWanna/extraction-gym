@@ -11,7 +11,7 @@ use extraction_gym::extract::ilp::*;
 // egraph: nodes carry cost (size), delay (depth) and initial flags
 let options = IlpOptions::default()                  // 10 s, WarmStart::Initial, 1 thread
     .with_time_limit(Duration::from_secs(60));
-let outcome = SizeConstrainedDepthExtractor { depth_budget, options }
+let outcome = SizeConstrainedDepthExtractor { depth_budget: DepthBudget::Initial, options }
     .solve(&egraph, &roots)?;                        // Err only for an invalid request
 
 let extraction = outcome.extraction;                 // CompleteExtraction
@@ -31,7 +31,7 @@ extractor also implements `Extractor` (panicking on an invalid request).
 |---|---|---|
 | `SizeExtractor` | min size | min area |
 | `DepthExtractor` | min depth | min delay (prefer `greedy::GreedyDepthExtractor`: exact and fast) |
-| `SizeConstrainedDepthExtractor { depth_budget }` | min size s.t. depth <= budget | min area without worsening delay |
+| `SizeConstrainedDepthExtractor { depth_budget }` | min size s.t. depth <= budget | min area without worsening delay (`DepthBudget::Initial`: the budget is the initial expression's depth) |
 | `WeightedSizeDepthExtractor { size_weight, depth_weight }` | min `size_weight*size + depth_weight*depth` | area/delay trade-off |
 
 ## Warm start and fallback

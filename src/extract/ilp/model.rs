@@ -74,7 +74,7 @@ pub(crate) fn build<M: MilpModel>(
     let classes = add_selection(model, egraph);
     let depth = objective
         .uses_depth()
-        .then(|| add_depth(model, egraph, roots, &classes, objective.depth_budget()));
+        .then(|| add_depth(model, egraph, roots, &classes, objective.budget_value()));
 
     model.set_obj_sense(MilpSense::Minimize);
     let (size_weight, depth_weight) = objective.weights();

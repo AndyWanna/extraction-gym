@@ -72,7 +72,7 @@ pub(crate) fn best(objective: IlpObjective, candidates: &[Candidate]) -> (usize,
             .min_by(|(_, a), (_, b)| key(a).total_cmp(&key(b)))
             .map(|(i, _)| i)
     };
-    match objective.depth_budget() {
+    match objective.budget_value() {
         None => (
             min_by(|c| c.objective, &|_| true).expect("at least one candidate"),
             false,

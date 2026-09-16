@@ -8,7 +8,7 @@ Four extractors, each one [`IlpObjective`] over the single model in
 |---|---|---|
 | [`SizeExtractor`] | size | area |
 | [`DepthExtractor`] | depth | critical-path delay |
-| [`SizeConstrainedDepthExtractor`] | size, subject to depth `<= depth_budget` | area without worsening delay |
+| [`SizeConstrainedDepthExtractor`] | size, subject to depth `<= depth_budget` | area without worsening delay ([`DepthBudget::Initial`]) |
 | [`WeightedSizeDepthExtractor`] | `size_weight * size + depth_weight * depth` | area/delay trade-off |
 
 Every extractor takes [`IlpOptions`] (time limit, default
@@ -21,7 +21,8 @@ expression from `Node::initial`:
 
 ```ignore
 let options = IlpOptions::default().with_time_limit(Duration::from_secs(60)); // default 10 s
-let outcome = SizeConstrainedDepthExtractor { depth_budget, options }.solve(&egraph, &roots)?;
+let outcome = SizeConstrainedDepthExtractor { depth_budget: DepthBudget::Initial, options }
+    .solve(&egraph, &roots)?;
 let extraction = outcome.extraction;   // CompleteExtraction
 let report = outcome.report;           // SolveReport: outcome, status, gap, ...
 ```
@@ -36,7 +37,7 @@ pub mod report;
 pub mod solve;
 pub mod warm;
 
-pub use objective::IlpObjective;
+pub use objective::{DepthBudget, IlpObjective};
 pub use options::{IlpOptions, WarmStart, DEFAULT_TIME_LIMIT};
 pub use report::{SolveOutcome, SolveReport};
 pub use solve::{solve, IlpError, IlpOutcome};
@@ -61,7 +62,7 @@ pub struct DepthExtractor {
 /// [`IlpObjective::SizeConstrainedDepth`].
 #[derive(Debug, Clone)]
 pub struct SizeConstrainedDepthExtractor {
-    pub depth_budget: f64,
+    pub depth_budget: DepthBudget,
     pub options: IlpOptions,
 }
 

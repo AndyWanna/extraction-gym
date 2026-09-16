@@ -4,7 +4,7 @@ Each struct here is one `ilp::IlpObjective` solved by `ilp::solve`:
 
   IlpExtractor              Size
   DualIlpExtractor          WeightedSizeDepth { size_weight: beta, depth_weight: alpha }
-  DelayBudgetIlpExtractor   SizeConstrainedDepth { depth_budget: max_delay }
+  DelayBudgetIlpExtractor   SizeConstrainedDepth { depth_budget: Fixed(max_delay) }
 
 so they share its guarantee: the result is complete unless the input itself is
 invalid (then it is empty). Deprecated: use the `ilp` extractors directly.
@@ -20,7 +20,7 @@ aliases so downstream crates don't have to change.
 use super::faster_ilp_cbc::WarmConfig;
 use super::ilp::options::time_limit_from_seconds;
 use super::ilp::solve::solve_with_initial;
-use super::ilp::{IlpObjective, IlpOptions, SolveOutcome, SolveReport, WarmStart};
+use super::ilp::{DepthBudget, IlpObjective, IlpOptions, SolveOutcome, SolveReport, WarmStart};
 use super::*;
 use crate::milp::{DefaultMilp, MilpModel};
 use indexmap::IndexSet;
@@ -178,7 +178,7 @@ fn extract_delay_budget<M: MilpModel>(
     warm: &WarmConfig,
 ) -> (ExtractionResult, SolveReport) {
     let objective = IlpObjective::SizeConstrainedDepth {
-        depth_budget: max_delay,
+        depth_budget: DepthBudget::Fixed(max_delay),
     };
     run::<M>(egraph, roots, objective, timeout_seconds, threads, warm)
 }
