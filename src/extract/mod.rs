@@ -10,6 +10,7 @@ pub mod faster_greedy_dag;
 #[cfg(feature = "ilp-any")]
 pub mod faster_ilp_cbc;
 pub mod global_greedy_dag;
+pub mod greedy;
 pub mod greedy_dag;
 #[cfg(feature = "ilp-any")]
 pub mod ilp_cbc;
@@ -318,6 +319,7 @@ mod complete_tests {
             eclass: eclass.into(),
             cost: Cost::new(1.0).unwrap(),
             delay: Cost::new(1.0).unwrap(),
+            initial: false,
         };
         egraph.add_node("b.0", leaf("b", vec![]));
         egraph.add_node("a.0", leaf("a", vec!["b.0".into()]));
