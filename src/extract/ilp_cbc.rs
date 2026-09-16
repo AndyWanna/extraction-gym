@@ -1,31 +1,27 @@
 /* The DAG-optimal ILP extractors, under their original names.
 
-Each struct here is one `ilp::IlpObjective` over the shared model in
-`ilp::model`:
+Each struct here is one `ilp::IlpObjective` solved by `ilp::solve`:
 
   IlpExtractor              Size
   DualIlpExtractor          WeightedSizeDepth { size_weight: beta, depth_weight: alpha }
   DelayBudgetIlpExtractor   SizeConstrainedDepth { depth_budget: max_delay }
 
-When the solver produces no solution these return an EMPTY selection for the
-caller to floor against its own candidates.
+so they share its guarantee: the result is complete unless the input itself is
+invalid (then it is empty). New code should use the `ilp` extractors directly.
 
-The solver is abstracted behind `crate::milp::MilpModel`, so the same model can
-be built for CBC / Gurobi / HiGHS. The public extractor structs default to
-`milp::DefaultMilp` (the one backend feature that is enabled), and
-`*_with::<M>()` methods let a caller pin a backend explicitly. The historical
-`*CbcExtractor` names are kept as type aliases so downstream crates don't have
-to change.
+The public extractor structs default to `milp::DefaultMilp` (the one backend
+feature that is enabled), and `*_with::<M>()` methods let a caller pin a
+backend explicitly. The historical `*CbcExtractor` names are kept as type
+aliases so downstream crates don't have to change.
 */
 
 use super::faster_ilp_cbc::WarmConfig;
-use super::ilp::decode::decode_selection;
-use super::ilp::model::{self, IlpVars};
-use super::ilp::{warm as seed, IlpObjective};
-use super::warm::{SolveReport, WarmStartMode};
+use super::ilp::options::time_limit_from_seconds;
+use super::ilp::solve::solve_with_initial;
+use super::ilp::{warm as seed, IlpObjective, IlpOptions, SolveOutcome, SolveReport, WarmStart};
 use super::*;
-use crate::milp::{DefaultMilp, MilpModel, MilpSolution};
-use std::time::Instant;
+use crate::milp::{DefaultMilp, MilpModel};
+use std::path::PathBuf;
 
 /// DAG-optimal ILP extractor with a compile-time timeout. Backend-generic; use
 /// [`CbcExtractorWithTimeout`] for the previous (CBC) spelling.
@@ -180,6 +176,11 @@ fn extract_delay_budget<M: MilpModel>(
     run::<M>(egraph, roots, objective, timeout_seconds, threads, warm)
 }
 
+/// Adapter from the legacy fields onto [`ilp::solve`](super::ilp::solve).
+///
+/// `warm.seed` plays the role of the initial extraction (repaired onto this
+/// e-graph by `build_seed`). `WarmStartMode::Initial` without a seed runs with
+/// no MIP start, as it always has.
 fn run<M: MilpModel>(
     egraph: &EGraph,
     roots: &[ClassId],
@@ -188,146 +189,47 @@ fn run<M: MilpModel>(
     threads: u32,
     warm: &WarmConfig,
 ) -> (ExtractionResult, SolveReport) {
-    let mut report = SolveReport::new(
-        M::NAME,
-        objective.name(),
-        threads,
-        timeout_seconds,
-        warm.mode,
-    );
-    let mut model = M::new();
-    model.set_time_limit_seconds(timeout_seconds);
-    model.set_threads(threads);
-    if let Some(path) = &warm.milp_log {
-        model.set_log_file(path);
-        report.milp_log = Some(path.clone());
-    }
-
-    let vars = model::build(&mut model, egraph, roots, objective);
-    apply_warm_start(&mut model, egraph, roots, &vars, warm, &mut report);
-
-    let solve_clock = Instant::now();
-    let solution = model.solve();
-    report.num_solves = 1;
-    report.solve_wall_secs = solve_clock.elapsed().as_secs_f64();
-    report.record_solution(&solution);
-    report.load_trajectory();
-    log::info!(
-        "{} {} status {}",
-        objective.name(),
-        M::NAME,
-        solution.status_detail(),
-    );
-
-    if !solution.has_solution() {
-        log::info!(
-            "{} returned no solution ({}); returning an empty selection for the \
-             caller to floor against its own candidates",
-            M::NAME,
-            solution.status_detail()
-        );
-        report.returned_fallback = true;
-        return (ExtractionResult::default(), report);
-    }
-    if !solution.ran_to_completion() {
-        // Keep the incumbent: the model blocks cycles exactly and enforces any
-        // depth budget, so every feasible solution is a valid answer.
-        log::info!(
-            "Unfinished {} solution, but an incumbent exists (obj = {}); returning it",
-            M::NAME,
-            solution.obj_value(),
-        );
-    }
-
-    (decode_selection(&solution, egraph, &vars.classes), report)
-}
-
-/// Warm-start entry point.
-///
-/// Everything here is refusable: any problem with the candidate ends in
-/// [`SolveReport::refuse_warm_start`] and a solve with no MIP start, never a
-/// panic and never an infeasible point pushed to the solver.
-fn apply_warm_start<M: MilpModel>(
-    model: &mut M,
-    egraph: &EGraph,
-    roots: &[ClassId],
-    vars: &IlpVars<M::Col>,
-    warm: &WarmConfig,
-    report: &mut SolveReport,
-) {
-    let preferred = match warm.mode {
-        WarmStartMode::None => return,
-        WarmStartMode::Greedy => {
-            return report.refuse_warm_start(
-                "greedy seeding is not supported by the ilp_cbc extractors; pass a \
-                 caller-supplied seed with WarmStartMode::Initial",
-            )
-        }
-        WarmStartMode::Initial => match &warm.seed {
-            Some(s) => s,
-            None => {
-                return report.refuse_warm_start(
-                    "no initial extraction was supplied; running with no MIP start",
-                )
+    let initial = warm.seed.as_ref().and_then(|preferred| {
+        let seed = seed::build_seed(egraph, roots, Some(preferred), &ExtractionResult::default());
+        match seed.and_then(|s| CompleteExtraction::try_new(s.selection, egraph, roots)) {
+            Ok(e) => Some(e),
+            Err(why) => {
+                log::warn!("ignoring the supplied seed: {why}");
+                None
             }
-        },
-    };
-    if !model.supports_warm_start() {
-        return report.refuse_warm_start(format!(
-            "{} does not support a trustworthy MIP start (see CbcModel::supports_warm_start)",
-            M::NAME
-        ));
-    }
-
-    // Repair a class the seed cannot fill with its cheapest member.
-    let seed = match seed::build_seed(egraph, roots, Some(preferred), &ExtractionResult::default())
-    {
-        Ok(s) => s,
-        Err(why) => return report.refuse_warm_start(why),
-    };
-    let mut note = (seed.repaired > 0).then(|| {
-        format!(
-            "{} class(es) repaired off the preferred node",
-            seed.repaired
-        )
-    });
-
-    let arrival = match &vars.depth {
-        None => None,
-        Some(_) => match seed::arrival_times(egraph, roots, &seed.selection) {
-            Ok(t) => Some(t),
-            Err(why) => return report.refuse_warm_start(why),
-        },
-    };
-
-    // The budget caps EVERY arrival column, so a single interior class over
-    // budget makes the point infeasible.
-    if let (Some(budget), Some(times)) = (vars.depth.as_ref().and_then(|d| d.budget), &arrival) {
-        let worst = times.values().cloned().fold(0.0f64, f64::max);
-        if worst > budget {
-            return report.refuse_warm_start(format!(
-                "candidate seed violates the depth budget: worst class arrival {worst:.9} > \
-                 budget {budget:.9} (over by {:.3e})",
-                worst - budget
-            ));
         }
-        let extra = format!("depth slack {:.3e} under the budget", budget - worst);
-        note = Some(match note {
-            Some(n) => format!("{n}; {extra}"),
-            None => extra,
-        });
+    });
+    let warm_start = match (warm.mode, &initial) {
+        (WarmStart::Initial, None) => WarmStart::None,
+        (mode, _) => mode,
+    };
+    let options = IlpOptions {
+        time_limit: time_limit_from_seconds(timeout_seconds),
+        threads,
+        warm_start,
+        solver_log: warm.milp_log.as_ref().map(PathBuf::from),
+        raw_params: Vec::new(),
+    };
+    match solve_with_initial::<M>(egraph, roots, objective, &options, initial) {
+        Ok(outcome) => (outcome.extraction.into_inner(), outcome.report),
+        Err(e) => {
+            log::warn!(
+                "{} ILP extraction: {e}; returning an empty selection",
+                objective.name()
+            );
+            let mut report = SolveReport::new(
+                M::NAME,
+                objective.name(),
+                threads,
+                options.time_limit,
+                warm.mode,
+            );
+            report.outcome = SolveOutcome::Fallback {
+                reason: e.to_string(),
+            };
+            (ExtractionResult::default(), report)
+        }
     }
-
-    seed::push_seed(
-        model,
-        egraph,
-        roots,
-        vars,
-        &seed.selection,
-        arrival.as_ref(),
-    );
-    report.warm_start_objective = seed::try_dag_cost(egraph, roots, &seed.selection);
-    report.accept_warm_start(WarmStartMode::Initial, note);
 }
 
 /// Joint delay+area ILP extractor. Backend-generic; use [`DualCbcExtractor`]

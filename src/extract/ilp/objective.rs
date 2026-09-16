@@ -11,6 +11,9 @@ Vocabulary, used throughout [`super`]:
   delay.
 */
 
+use crate::extract::greedy::{GreedyDepthExtractor, GreedySizeExtractor};
+use crate::*;
+
 /// The quantity an ILP extraction minimises.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum IlpObjective {
@@ -63,5 +66,40 @@ impl IlpObjective {
     /// Whether the model needs arrival-time (depth) variables.
     pub(crate) fn uses_depth(&self) -> bool {
         !matches!(self, IlpObjective::Size)
+    }
+
+    /// Value of this objective for `extraction`, in the same units as the
+    /// solver's objective. For [`Self::SizeConstrainedDepth`] this is the
+    /// size alone; the budget is checked separately.
+    pub fn evaluate(
+        &self,
+        egraph: &EGraph,
+        roots: &[ClassId],
+        extraction: &CompleteExtraction,
+    ) -> f64 {
+        let (size_weight, depth_weight) = self.weights();
+        let mut value = 0.0;
+        if size_weight != 0.0 {
+            value += size_weight * extraction.dag_cost(egraph, roots).into_inner();
+        }
+        if depth_weight != 0.0 {
+            value += depth_weight * extraction.dag_depth(egraph, roots).into_inner();
+        }
+        value
+    }
+
+    /// The solver-free extractor paired with this objective, used for the
+    /// `WarmStart::Greedy` seed and the fallback. A depth budget pairs with
+    /// the depth extractor, the only one guaranteed to meet any attainable
+    /// budget.
+    pub(crate) fn greedy_extractor(&self) -> (&'static str, Box<dyn Extractor>) {
+        match self {
+            IlpObjective::Size | IlpObjective::WeightedSizeDepth { .. } => {
+                ("greedy-size", GreedySizeExtractor.boxed())
+            }
+            IlpObjective::Depth | IlpObjective::SizeConstrainedDepth { .. } => {
+                ("greedy-depth", GreedyDepthExtractor.boxed())
+            }
+        }
     }
 }

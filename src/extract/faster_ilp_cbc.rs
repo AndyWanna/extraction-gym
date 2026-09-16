@@ -59,7 +59,8 @@ we get an optimal solution without cycles.
 
 */
 
-use super::warm::{SolveReport, WarmStartMode};
+use super::ilp::options::time_limit_from_seconds;
+use super::warm::{SolveOutcome, SolveReport, WarmStartMode};
 use super::*;
 use crate::milp::{DefaultMilp, MilpModel, MilpSolution};
 use indexmap::IndexSet;
@@ -202,6 +203,12 @@ pub struct WarmConfig {
     pub milp_log: Option<String>,
 }
 
+fn fallback(reason: &str) -> SolveOutcome {
+    SolveOutcome::Fallback {
+        reason: reason.to_string(),
+    }
+}
+
 /// Simplifying DAG-optimal ILP extractor with a compile-time timeout.
 /// Backend-generic; [`FasterCbcExtractorWithTimeout`] is the legacy spelling.
 pub struct FasterIlpExtractorWithTimeout<const TIMEOUT_IN_SECONDS: u32>;
@@ -337,7 +344,15 @@ fn extract<M: MilpModel>(
     threads: u32,
     warm: &WarmConfig,
 ) -> (ExtractionResult, SolveReport) {
-    let mut report = SolveReport::new(M::NAME, "area-ilp", threads, timeout, warm.mode);
+    let mut report = SolveReport::new(
+        M::NAME,
+        "area-ilp",
+        threads,
+        time_limit_from_seconds(timeout),
+        warm.mode,
+    );
+    // Every early return below that is not the solver's answer overrides this.
+    report.outcome = SolveOutcome::Optimal;
     // todo from now on we don't use roots_slice - be good to prevent using it any more.
     let mut roots = roots_slice.to_vec();
     roots.sort();
@@ -353,7 +368,7 @@ fn extract<M: MilpModel>(
     // own log to a file (still nothing on stdout). See `MilpModel::set_log_file`.
     if let Some(path) = &warm.milp_log {
         model.set_log_file(path);
-        report.milp_log = Some(path.clone());
+        report.solver_log = Some(path.clone());
     }
 
     let n2c = |nid: &NodeId| egraph.nid_to_cid(nid);
@@ -388,7 +403,7 @@ fn extract<M: MilpModel>(
     // Reported unconditionally: on timeout the extractor may return this
     // instead of the solver's answer, and a reader who cannot tell the two
     // apart would mistake "greedy" for "what the solver achieved".
-    report.initial_cost = Some(initial_result_cost.into_inner());
+    report.fallback_objective = Some(initial_result_cost.into_inner());
 
     // For classes where we know the choice already, we set the nodes early.
     let mut result = ExtractionResult::default();
@@ -627,7 +642,7 @@ fn extract<M: MilpModel>(
                     solution.obj_value(),
                     initial_result_cost
                 );
-                report.returned_fallback = true;
+                report.outcome = fallback("unfinished solution no better than greedy");
                 report.load_trajectory();
                 return (initial_result, report);
             }
@@ -684,14 +699,15 @@ fn extract<M: MilpModel>(
                         "Returning result of incomplete search saving: {}",
                         initial_result_cost - extraction_dag_cost
                     );
+                    report.outcome = SolveOutcome::Incumbent;
                     return (result, report);
                 } else {
-                    report.returned_fallback = true;
+                    report.outcome = fallback("unfinished solution no better than greedy");
                     return (initial_result, report);
                 }
             } else {
                 log::info!("Found cycle in solution, but solver timed out");
-                report.returned_fallback = true;
+                report.outcome = fallback("solution has a cycle and the solver timed out");
                 return (initial_result, report);
             }
         }
