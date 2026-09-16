@@ -127,3 +127,6 @@ ilp_extractor!(WeightedSizeDepthExtractor, |s| {
         depth_weight: s.depth_weight,
     }
 });
+
+#[cfg(test)]
+mod tests;

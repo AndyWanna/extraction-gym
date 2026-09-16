@@ -49,8 +49,9 @@ impl std::str::FromStr for WarmStart {
 /// Solver settings shared by every ILP extractor.
 #[derive(Debug, Clone)]
 pub struct IlpOptions {
-    /// Wall-clock limit for the solve. `None` is unbounded, which can take
-    /// hours on large e-graphs.
+    /// Wall-clock limit for the solve, rounded up to whole seconds. `None` is
+    /// unbounded, which can take hours on large e-graphs. Zero stops the solver
+    /// before it even loads a warm start, so it always returns the fallback.
     pub time_limit: Option<Duration>,
     /// Solver threads. Keep `threads x concurrent solver processes` within
     /// the CPU allocation; see `MilpModel::set_threads`.
