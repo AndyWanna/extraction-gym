@@ -582,7 +582,7 @@ fn extract<M: MilpModel>(
                         applied.choose(cid.clone(), vars[cid].members[idx].clone());
                     }
                     report.warm_start_objective =
-                        super::warm::try_dag_cost(egraph, &roots, &applied);
+                        try_dag_cost(egraph, &roots, &applied);
                     apply_seed(&vars, &mut model, &assignment);
                     if repaired > 0 {
                         let extra = format!(
@@ -1612,4 +1612,32 @@ mod test {
         random0, random1, random2, random3, random4, random5, random6, random7, random8, random9,
         random10
     );
+}
+
+/// [`ExtractionResult::dag_cost`], but returning `None` instead of panicking on
+/// a selection that does not cover every class reachable from `roots`.
+///
+/// `dag_cost` indexes `choices[cid]` directly, so a partial selection is a
+/// panic — unacceptable in *reporting* code, which is the only thing that ever
+/// looks at a seed's cost. A missing number is fine; a crash while writing the
+/// metadata sidecar would lose the whole run.
+#[deprecated(note = "use CompleteExtraction, which can be costed without panicking")]
+pub fn try_dag_cost(
+    egraph: &EGraph,
+    roots: &[ClassId],
+    selection: &ExtractionResult,
+) -> Option<f64> {
+    let mut costs: IndexMap<ClassId, f64> = IndexMap::default();
+    let mut todo: Vec<ClassId> = roots.to_vec();
+    while let Some(cid) = todo.pop() {
+        let nid = selection.choices.get(&cid)?;
+        let node = &egraph[nid];
+        if costs.insert(cid, node.cost.into_inner()).is_some() {
+            continue;
+        }
+        for child in &node.children {
+            todo.push(egraph.nid_to_cid(child).clone());
+        }
+    }
+    Some(costs.values().sum())
 }

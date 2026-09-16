@@ -20,9 +20,10 @@ aliases so downstream crates don't have to change.
 use super::faster_ilp_cbc::WarmConfig;
 use super::ilp::options::time_limit_from_seconds;
 use super::ilp::solve::solve_with_initial;
-use super::ilp::{warm as seed, IlpObjective, IlpOptions, SolveOutcome, SolveReport, WarmStart};
+use super::ilp::{IlpObjective, IlpOptions, SolveOutcome, SolveReport, WarmStart};
 use super::*;
 use crate::milp::{DefaultMilp, MilpModel};
+use indexmap::IndexSet;
 use std::path::PathBuf;
 
 /// DAG-optimal ILP extractor with a compile-time timeout. Backend-generic; use
@@ -196,7 +197,7 @@ fn run<M: MilpModel>(
     warm: &WarmConfig,
 ) -> (ExtractionResult, SolveReport) {
     let initial = warm.seed.as_ref().and_then(|preferred| {
-        let seed = seed::build_seed(egraph, roots, Some(preferred), &ExtractionResult::default());
+        let seed = build_seed(egraph, roots, Some(preferred), &ExtractionResult::default());
         match seed.and_then(|s| CompleteExtraction::try_new(s.selection, egraph, roots)) {
             Ok(e) => Some(e),
             Err(why) => {
@@ -383,4 +384,99 @@ impl DelayBudgetIlpExtractor {
             &self.warm,
         )
     }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Legacy seed repair                                                          */
+/* -------------------------------------------------------------------------- */
+
+/// Outcome of [`build_seed`].
+#[deprecated(note = "seeds are now complete extractions; see ilp::WarmStart")]
+pub struct Seed {
+    /// One chosen node per class reachable from the roots. Complete and
+    /// acyclic by construction.
+    pub selection: ExtractionResult,
+    /// How many classes had to fall back off the preferred choice (because the
+    /// preferred node was absent or belonged to a different class after
+    /// congruence). Reported, not fatal.
+    pub repaired: usize,
+}
+
+/// Build a **complete, acyclic** selection over `egraph` from a `preferred`
+/// partial choice, repairing to `fallback` wherever `preferred` cannot be used.
+///
+/// The walk starts at `roots` and only ever descends through the children of a
+/// node it has already committed to, so the result satisfies the ILP's
+/// "node active implies child class active" rows by construction — which is
+/// precisely the property the old, disabled seeding code did *not* have.
+///
+/// Returns `Err` if the walk hits a class neither map can fill, or if the
+/// committed selection contains a cycle. Both are refusals, not panics.
+#[deprecated(note = "seeds are now complete extractions; see ilp::WarmStart")]
+pub fn build_seed(
+    egraph: &EGraph,
+    roots: &[ClassId],
+    preferred: Option<&ExtractionResult>,
+    fallback: &ExtractionResult,
+) -> Result<Seed, String> {
+    let mut selection = ExtractionResult::default();
+    let mut repaired = 0usize;
+    // Iterative DFS so a deep e-graph cannot blow the stack.
+    let mut todo: Vec<ClassId> = roots.to_vec();
+    let mut seen: IndexSet<ClassId> = IndexSet::default();
+
+    while let Some(cid) = todo.pop() {
+        if !seen.insert(cid.clone()) {
+            continue;
+        }
+        let pick = pick_node(egraph, &cid, preferred, fallback, &mut repaired)?;
+        for child in &egraph[&pick].children {
+            todo.push(egraph.nid_to_cid(child).clone());
+        }
+        selection.choose(cid, pick);
+    }
+
+    if !selection.find_cycles(egraph, roots).is_empty() {
+        return Err("candidate seed selection contains a cycle".to_string());
+    }
+    Ok(Seed {
+        selection,
+        repaired,
+    })
+}
+
+fn pick_node(
+    egraph: &EGraph,
+    cid: &ClassId,
+    preferred: Option<&ExtractionResult>,
+    fallback: &ExtractionResult,
+    repaired: &mut usize,
+) -> Result<NodeId, String> {
+    // A choice is usable only if the node really lives in this class: after
+    // congruence closure two classes the seed treated separately may have
+    // merged, and the stale choice then belongs to a sibling.
+    let usable = |nid: &NodeId| egraph[nid].eclass == *cid;
+
+    if let Some(p) = preferred {
+        if let Some(nid) = p.choices.get(cid) {
+            if usable(nid) {
+                return Ok(nid.clone());
+            }
+        }
+        *repaired += 1;
+    }
+    if let Some(nid) = fallback.choices.get(cid) {
+        if usable(nid) {
+            return Ok(nid.clone());
+        }
+    }
+    // Last resort: the cheapest member. Keeps the seed complete when the
+    // fallback extraction did not reach this class (it can happen when the
+    // preferred choice steers the walk somewhere greedy never went).
+    egraph[cid]
+        .nodes
+        .iter()
+        .min_by(|a, b| egraph[*a].cost.cmp(&egraph[*b].cost))
+        .cloned()
+        .ok_or_else(|| format!("class {cid} has no nodes to seed with"))
 }
