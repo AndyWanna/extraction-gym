@@ -11,6 +11,8 @@ pub mod faster_greedy_dag;
 pub mod faster_ilp_cbc;
 pub mod global_greedy_dag;
 pub mod greedy;
+#[cfg(feature = "ilp-any")]
+pub mod ilp;
 pub mod greedy_dag;
 #[cfg(feature = "ilp-any")]
 pub mod ilp_cbc;
