@@ -11,7 +11,8 @@ Four extractors, each one [`IlpObjective`] over the single model in
 | [`SizeConstrainedDepthExtractor`] | size, subject to depth `<= depth_budget` | area without worsening delay |
 | [`WeightedSizeDepthExtractor`] | `size_weight * size + depth_weight * depth` | area/delay trade-off |
 
-Every extractor takes [`IlpOptions`] (time limit, threads, [`WarmStart`]) and
+Every extractor takes [`IlpOptions`] (time limit, default
+[`DEFAULT_TIME_LIMIT`] = 10 s; threads; [`WarmStart`], default initial) and
 always returns a complete extraction: if the solver fails, the better of the
 initial and greedy extractions is returned instead (see [`solve`]).
 
@@ -19,7 +20,7 @@ Sizes come from `Node::cost`, depths from `Node::delay`, and the initial
 expression from `Node::initial`:
 
 ```ignore
-let options = IlpOptions::default().with_time_limit(Duration::from_secs(60));
+let options = IlpOptions::default().with_time_limit(Duration::from_secs(60)); // default 10 s
 let outcome = SizeConstrainedDepthExtractor { depth_budget, options }.solve(&egraph, &roots)?;
 let extraction = outcome.extraction;   // CompleteExtraction
 let report = outcome.report;           // SolveReport: outcome, status, gap, ...
@@ -36,7 +37,7 @@ pub mod solve;
 pub mod warm;
 
 pub use objective::IlpObjective;
-pub use options::{IlpOptions, WarmStart};
+pub use options::{IlpOptions, WarmStart, DEFAULT_TIME_LIMIT};
 pub use report::{SolveOutcome, SolveReport};
 pub use solve::{solve, IlpError, IlpOutcome};
 

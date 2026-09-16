@@ -46,11 +46,15 @@ impl std::str::FromStr for WarmStart {
     }
 }
 
+/// The time limit [`IlpOptions::default`] uses.
+pub const DEFAULT_TIME_LIMIT: Duration = Duration::from_secs(10);
+
 /// Solver settings shared by every ILP extractor.
 #[derive(Debug, Clone)]
 pub struct IlpOptions {
-    /// Wall-clock limit for the solve, rounded up to whole seconds. `None` is
-    /// unbounded, which can take hours on large e-graphs. Zero stops the solver
+    /// Wall-clock limit for the solve, rounded up to whole seconds. Defaults
+    /// to [`DEFAULT_TIME_LIMIT`]. `None` is unbounded, which can take hours on
+    /// large e-graphs. Zero stops the solver
     /// before it even loads a warm start, so it always returns the fallback.
     pub time_limit: Option<Duration>,
     /// Solver threads. Keep `threads x concurrent solver processes` within
@@ -68,7 +72,7 @@ pub struct IlpOptions {
 impl Default for IlpOptions {
     fn default() -> Self {
         IlpOptions {
-            time_limit: None,
+            time_limit: Some(DEFAULT_TIME_LIMIT),
             threads: 1,
             warm_start: WarmStart::default(),
             solver_log: None,
@@ -80,6 +84,12 @@ impl Default for IlpOptions {
 impl IlpOptions {
     pub fn with_time_limit(mut self, time_limit: Duration) -> Self {
         self.time_limit = Some(time_limit);
+        self
+    }
+
+    /// Remove the time limit. May take hours on large e-graphs.
+    pub fn without_time_limit(mut self) -> Self {
+        self.time_limit = None;
         self
     }
 
