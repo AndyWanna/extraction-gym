@@ -72,6 +72,37 @@ pub struct ExtractionResult {
     pub choices: IndexMap<ClassId, NodeId>,
 }
 
+/// An [`ExtractionResult`] proven valid for a specific set of roots (see
+/// [`ExtractionResult::validate`]). The only constructor validates, so holding
+/// one means the selection can be costed and converted without panicking.
+#[derive(Clone)]
+pub struct CompleteExtraction(ExtractionResult);
+
+impl CompleteExtraction {
+    pub fn try_new(
+        result: ExtractionResult,
+        egraph: &EGraph,
+        roots: &[ClassId],
+    ) -> Result<Self, String> {
+        if roots.is_empty() {
+            return Err("no roots to extract".to_string());
+        }
+        result.validate(egraph, roots)?;
+        Ok(CompleteExtraction(result))
+    }
+
+    pub fn into_inner(self) -> ExtractionResult {
+        self.0
+    }
+}
+
+impl std::ops::Deref for CompleteExtraction {
+    type Target = ExtractionResult;
+    fn deref(&self) -> &ExtractionResult {
+        &self.0
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Status {
     Doing,
@@ -79,37 +110,60 @@ enum Status {
 }
 
 impl ExtractionResult {
+    /// Panics unless this is a valid extraction of `egraph.root_eclasses`
+    /// (see [`Self::validate`]).
     pub fn check(&self, egraph: &EGraph) {
         // should be a root
         assert!(!egraph.root_eclasses.is_empty());
-
-        // All roots should be selected.
-        for cid in egraph.root_eclasses.iter() {
-            assert!(self.choices.contains_key(cid));
+        if let Err(why) = self.validate(egraph, &egraph.root_eclasses) {
+            panic!("invalid extraction: {why}");
         }
+    }
 
-        // No cycles
-        assert!(self.find_cycles(egraph, &egraph.root_eclasses).is_empty());
+    /// Whether this is a valid extraction of `roots`: see [`Self::validate`].
+    pub fn is_complete(&self, egraph: &EGraph, roots: &[ClassId]) -> bool {
+        self.validate(egraph, roots).is_ok()
+    }
 
+    /// `Ok` iff every class reachable from `roots` through the chosen nodes has
+    /// a choice, every choice lives in the class it is chosen for, and the
+    /// chosen nodes form no cycle. Choices for unreachable classes are ignored.
+    pub fn validate(&self, egraph: &EGraph, roots: &[ClassId]) -> Result<(), String> {
         // Nodes should match the class they are selected into.
         for (cid, nid) in &self.choices {
-            let node = &egraph[nid];
-            assert!(node.eclass == *cid);
+            if egraph[nid].eclass != *cid {
+                return Err(format!(
+                    "node {nid} is chosen for class {cid} but belongs to {}",
+                    egraph[nid].eclass
+                ));
+            }
         }
 
-        // All the nodes the roots depend upon should be selected.
-        let mut todo: Vec<ClassId> = egraph.root_eclasses.to_vec();
+        // All the nodes the roots depend upon should be selected. This walk
+        // must precede `find_cycles`, which indexes `choices` directly.
+        let mut todo: Vec<ClassId> = roots.to_vec();
         let mut visited: FxHashSet<ClassId> = Default::default();
         while let Some(cid) = todo.pop() {
             if !visited.insert(cid.clone()) {
                 continue;
             }
-            assert!(self.choices.contains_key(&cid));
-
-            for child in &egraph[&self.choices[&cid]].children {
+            let Some(nid) = self.choices.get(&cid) else {
+                return Err(format!("no choice for reachable class {cid}"));
+            };
+            for child in &egraph[nid].children {
                 todo.push(egraph.nid_to_cid(child).clone());
             }
         }
+
+        // No cycles
+        let cycles = self.find_cycles(egraph, roots);
+        if !cycles.is_empty() {
+            return Err(format!(
+                "chosen nodes form a cycle through class {}",
+                cycles[0]
+            ));
+        }
+        Ok(())
     }
 
     pub fn choose(&mut self, class_id: ClassId, node_id: NodeId) {
@@ -248,5 +302,53 @@ impl ExtractionResult {
                     costs.get(cid).unwrap_or(&INFINITY)
                 })
                 .sum::<Cost>()
+    }
+}
+
+#[cfg(test)]
+mod complete_tests {
+    use super::*;
+
+    /// `a(b)` with `b` a leaf, in two classes.
+    fn two_class_egraph() -> EGraph {
+        let mut egraph = EGraph::default();
+        let leaf = |eclass: &str, children: Vec<NodeId>| Node {
+            op: "op".into(),
+            children,
+            eclass: eclass.into(),
+            cost: Cost::new(1.0).unwrap(),
+            delay: Cost::new(1.0).unwrap(),
+        };
+        egraph.add_node("b.0", leaf("b", vec![]));
+        egraph.add_node("a.0", leaf("a", vec!["b.0".into()]));
+        egraph.root_eclasses.push("a".into());
+        egraph
+    }
+
+    #[test]
+    fn try_new_rejects_empty_result() {
+        let egraph = two_class_egraph();
+        let roots = egraph.root_eclasses.clone();
+        assert!(CompleteExtraction::try_new(ExtractionResult::default(), &egraph, &roots).is_err());
+    }
+
+    #[test]
+    fn try_new_rejects_missing_child() {
+        let egraph = two_class_egraph();
+        let roots = egraph.root_eclasses.clone();
+        let mut partial = ExtractionResult::default();
+        partial.choose("a".into(), "a.0".into());
+        assert!(!partial.is_complete(&egraph, &roots));
+        assert!(CompleteExtraction::try_new(partial, &egraph, &roots).is_err());
+    }
+
+    #[test]
+    fn try_new_accepts_complete_result() {
+        let egraph = two_class_egraph();
+        let roots = egraph.root_eclasses.clone();
+        let mut full = ExtractionResult::default();
+        full.choose("a".into(), "a.0".into());
+        full.choose("b".into(), "b.0".into());
+        assert!(CompleteExtraction::try_new(full, &egraph, &roots).is_ok());
     }
 }
