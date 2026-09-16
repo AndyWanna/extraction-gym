@@ -51,7 +51,7 @@ backends for no reason.
 // be a miserable thing to debug in a benchmark ("why is Gurobi as slow as
 // CBC?"), so it is a hard error instead. Pick exactly one:
 //
-//   --features ilp-cbc      (default, via the `ilp` alias)
+//   --features ilp-cbc
 //   --features ilp-gurobi
 //   --features ilp-highs
 
