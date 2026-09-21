@@ -159,9 +159,22 @@ pub(crate) fn push_seed<M: MilpModel>(
     seed: &ExtractionResult,
     arrival: Option<&IndexMap<ClassId, f64>>,
 ) {
-    // Selection binaries.
+    // Levels double as the reachability oracle: topological_levels walks the
+    // selection from the roots, so any class it did not reach is not part of
+    // the extraction.
+    let levels = topological_levels(egraph, roots, seed);
+
+    // Selection binaries. A greedy extractor chooses a node for every class it
+    // can cost, including classes the roots never reach, and ExtractionResult
+    // keeps those choices (validate only requires a choice for each *reachable*
+    // class). Seeding them would break the start two ways: such a class has no
+    // level, so its node's own cycle row -- level[child] - level[parent] >= 1
+    // with both defaulting to 0 -- is violated by exactly 1, and Gurobi throws
+    // the entire MIP start away as infeasible ("User MIP start violates
+    // constraint ... by 1.0"); and they add objective the optimum would never
+    // pay. So a class counts as chosen only if the roots actually reach it.
     for (cid, cvars) in &vars.classes {
-        let chosen = seed.choices.get(cid);
+        let chosen = seed.choices.get(cid).filter(|_| levels.contains_key(cid));
         model.set_col_initial_solution(cvars.active, if chosen.is_some() { 1.0 } else { 0.0 });
         for (nid, &col) in egraph[cid].nodes.iter().zip(&cvars.nodes) {
             let on = chosen == Some(nid);
@@ -174,7 +187,6 @@ pub(crate) fn push_seed<M: MilpModel>(
     }
 
     // Topological levels for the cycle-blocking rows.
-    let levels = topological_levels(egraph, roots, seed);
     for (cid, &col) in &vars.cycles.levels {
         model.set_col_initial_solution(col, *levels.get(cid).unwrap_or(&0.0));
     }
