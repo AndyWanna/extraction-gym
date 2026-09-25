@@ -14,11 +14,15 @@ version = "0.1.0"
 # a solver benchmark meaningless.
 #
 #   ilp-cbc     COIN-OR CBC via the `coin_cbc` crate. The baseline.
-#   ilp-gurobi  Gurobi 10 via `grb`. Needs GUROBI_HOME, GRB_LICENSE_FILE and
-#               $GUROBI_HOME/lib on LD_LIBRARY_PATH at build *and* run time
-#               (the shipped libgurobi100.so has no SONAME). If your Gurobi
-#               licence is a single token, do not run two Gurobi processes
-#               concurrently.
+#   ilp-gurobi  Gurobi (currently pinned to the gurobi12 grb feature -- the
+#               newest grb 3.0.1 supports) via `grb`. Needs GUROBI_HOME,
+#               GRB_LICENSE_FILE and $GUROBI_HOME/lib on LD_LIBRARY_PATH at
+#               build *and* run time. If your installed Gurobi is newer than
+#               what grb supports (e.g. v13, as of 2026-09), `source
+#               ../scripts/setup_gurobi_shim.sh` (from the parent repo)
+#               first -- see that script for how it's validated. If your
+#               Gurobi licence is a single token, do not run two Gurobi
+#               processes concurrently.
 #   ilp-highs   HiGHS 1.15 via the raw `highs-sys` FFI. Vendors and cmake-builds
 #               HiGHS itself (~4 min cold). The final link needs libstdc++ on
 #               the search path; build.rs adds it.
@@ -43,9 +47,11 @@ coin_cbc = { version = "0.1.6", optional = true }
 # Raw HiGHS C FFI. Deliberately NOT the high-level `highs` crate: that one hides
 # incremental model modification and the MIP start behind a builder API.
 highs-sys = { version = "1.15", optional = true }
+# EXPERIMENTAL: pinned to gurobi12 (the newest grb supports) via a symlink shim
+# at .gurobi_compat_shim, since this machine only has Gurobi 13 installed.
 # Pinned to the Gurobi 10 ABI; change the feature to match your installed Gurobi.
 grb = { version = "3.0.1", default-features = false, features = [
-    "gurobi10",
+    "gurobi12",
 ], optional = true }
 im-rc = "15.1.0"
 rustc-hash = "1.1.0"

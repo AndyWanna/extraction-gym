@@ -288,9 +288,9 @@ dependencies = [
 
 [[package]]
 name = "grb-sys2"
-version = "10.2.2"
+version = "12.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "21ffbc24a9a4b5548d60a1435950a51808bba5ddb56f2f4c2e44d0b3420f3d43"
+checksum = "ae602a07b509e70fed9e88acc4b157087e310a1741ee674fe51e7e4aef06c92a"
 dependencies = [
  "anyhow",
 ]
